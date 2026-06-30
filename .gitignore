@@ -7,3 +7,8 @@
 # Env / editor
 .env
 .DS_Store
+.log
+
+# Runtime logs
+run.log
+*.log
