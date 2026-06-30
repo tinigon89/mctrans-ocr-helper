@@ -1,0 +1,95 @@
+name: release
+
+# Build native binaries for Windows / Linux / macOS on GitHub's runners and
+# attach them to the release for the pushed tag. No local Mac/Linux box needed.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows: candle + llama on CUDA (NVIDIA). Vulkan fallback at runtime.
+          - os: windows-2022
+            features: cuda
+            artifact: mctrans-ocr-helper-windows-x64
+            ext: zip
+          # Linux: candle on CPU, llama on Vulkan (koharu ships a Vulkan runtime
+          # for Linux). NVIDIA users wanting GPU detection build cuda from source.
+          - os: ubuntu-latest
+            features: ''
+            artifact: mctrans-ocr-helper-linux-x64
+            ext: tar.gz
+          # macOS (Apple Silicon): candle + llama on Metal — full GPU.
+          - os: macos-latest
+            features: metal
+            artifact: mctrans-ocr-helper-macos-arm64
+            ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # --- Windows toolchain: CUDA 13 + MSVC + LLVM (preinstalled on the runner) ---
+      - if: startsWith(matrix.os, 'windows')
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '13.0.0'
+          sub-packages: '["nvcc","cudart","crt","thrust","nvvm","cublas","cublas_dev","cufft","cufft_dev","curand","curand_dev","nvrtc","nvrtc_dev"]'
+      - if: startsWith(matrix.os, 'windows')
+        uses: ilammy/msvc-dev-cmd@v1
+      - if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+
+      # --- Linux toolchain: cmake + clang/libclang ---
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      # --- macOS toolchain: cmake (libclang ships with Xcode) ---
+      - if: startsWith(matrix.os, 'macos')
+        run: brew install cmake
+
+      - name: Build
+        shell: bash
+        env:
+          # Compile candle's CUDA kernels for a broad arch (Turing → newer JIT
+          # forward from sm_75 PTX). Overrides the dev value in .cargo/config.toml.
+          CUDA_COMPUTE_CAP: '75'
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --features ${{ matrix.features }}
+          else
+            cargo build --release
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p stage
+          cp README.md stage/ 2>/dev/null || true
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/mctrans-ocr-helper.exe stage/
+            cp run.bat stage/ 2>/dev/null || true
+            7z a "${{ matrix.artifact }}.zip" ./stage/*
+          else
+            cp target/release/mctrans-ocr-helper stage/
+            chmod +x stage/mctrans-ocr-helper
+            tar -czf "${{ matrix.artifact }}.tar.gz" -C stage .
+          fi
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.artifact }}.${{ matrix.ext }}

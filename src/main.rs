@@ -228,10 +228,16 @@ async fn async_main() -> anyhow::Result<()> {
     )
     .context("failed to init koharu runtime")?;
 
-    tracing::info!("loading models (ocr={}, inpainter={}, {})…", cfg.ocr, cfg.inpainter, device);
+    // Prepare the prebuilt runtime FIRST. On NVIDIA this downloads CUDA 13.1
+    // (cudart/cublas64_13 …) + the llama.cpp CUDA build and preloads them; candle
+    // (built against CUDA 13.1) then resolves the SAME cublas64_13 — no bundled
+    // DLLs, no PATH. On non-NVIDIA it fetches the Vulkan build and candle falls
+    // back to CPU. This mirrors koharu: the binary ships ~80 MB and the runtime
+    // is fetched to match the user's hardware on first launch.
+    tracing::info!("preparing runtime ({device})…");
+    runtime.prepare().await.context("prepare runtime")?;
 
-    // --- Candle models load FIRST, before any llama `prepare()` switches Windows
-    //     to a restricted DLL search that would hide the CUDA toolkit's cublas. ---
+    tracing::info!("loading models (ocr={}, inpainter={})…", cfg.ocr, cfg.inpainter);
     let layout = PPDocLayoutV3::load(&runtime, cpu).await.context("load PP-DocLayout V3")?;
     let segmenter = ComicTextDetector::load(&runtime, cpu).await.context("load segmenter")?;
 
@@ -245,10 +251,7 @@ async fn async_main() -> anyhow::Result<()> {
         "manga-ocr" => Ocr::Manga(MangaOcr::load(&runtime, cpu).await.context("load Manga OCR")?),
         "mit48px" => Ocr::Mit48px(Mit48pxOcr::load(&runtime, cpu).await.context("load MIT 48px")?),
         _ => {
-            // PaddleOCR-VL 1.6 GGUF via llama.cpp — set up the llama runtime now
-            // (after all candle models have grabbed their CUDA libs).
-            tracing::info!("preparing llama.cpp runtime…");
-            runtime.prepare().await.context("prepare llama runtime")?;
+            // PaddleOCR-VL 1.6 GGUF via llama.cpp (runtime already prepared above).
             koharu_llm::sys::initialize(&runtime).context("init llama.cpp bindings")?;
             let backend = Arc::new(
                 LlamaBackend::init().map_err(|e| anyhow::anyhow!("llama backend init: {e:?}"))?,
@@ -330,6 +333,7 @@ async fn ocr_page(
 ) -> Result<Json<OcrResponse>, AppError> {
     let mut img_bytes: Option<Vec<u8>> = None;
     let mut inpaint_override: Option<bool> = None;
+    let mut direction_override: Option<String> = None;
 
     while let Some(field) = form.next_field().await.map_err(AppError::bad)? {
         match field.name() {
@@ -337,6 +341,9 @@ async fn ocr_page(
             Some("inpaint") => {
                 let v = field.text().await.map_err(AppError::bad)?;
                 inpaint_override = Some(v == "true" || v == "1");
+            }
+            Some("direction") => {
+                direction_override = Some(field.text().await.map_err(AppError::bad)?);
             }
             _ => {}
         }
@@ -348,10 +355,12 @@ async fn ocr_page(
 
     let cfg = s.config.read().await.clone();
     let want_inpaint = inpaint_override.unwrap_or(cfg.default_inpaint);
+    // Per-request direction (from the web's reading-order setting) overrides config.
+    let direction = direction_override.as_deref().unwrap_or(&cfg.direction);
     let mut engines = s.engines.lock().await;
 
     // 1. Detect text blocks, then OCR each crop.
-    let regions = detect_regions(&engines, &img, cfg.det_threshold, &cfg.direction)
+    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction)
         .map_err(AppError::internal)?;
     let mut boxes = Vec::new();
     for (bbox, score) in regions {
@@ -500,12 +509,25 @@ async fn detect_handler(
     State(s): State<AppState>,
     mut form: Multipart,
 ) -> Result<Json<DetectResponse>, AppError> {
-    let img = read_image(&mut form).await?;
+    let mut img_bytes: Option<Vec<u8>> = None;
+    let mut direction_override: Option<String> = None;
+    while let Some(field) = form.next_field().await.map_err(AppError::bad)? {
+        match field.name() {
+            Some("file") => img_bytes = Some(field.bytes().await.map_err(AppError::bad)?.to_vec()),
+            Some("direction") => {
+                direction_override = Some(field.text().await.map_err(AppError::bad)?)
+            }
+            _ => {}
+        }
+    }
+    let bytes = img_bytes.ok_or_else(|| AppError::bad("missing 'file' field"))?;
+    let img = image::load_from_memory(&bytes).map_err(AppError::bad)?;
     let (iw, ih) = (img.width() as f32, img.height() as f32);
     let cfg = s.config.read().await.clone();
+    let direction = direction_override.as_deref().unwrap_or(&cfg.direction);
     let engines = s.engines.lock().await;
 
-    let regions = detect_regions(&engines, &img, cfg.det_threshold, &cfg.direction)
+    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction)
         .map_err(AppError::internal)?;
     let boxes = regions
         .into_iter()

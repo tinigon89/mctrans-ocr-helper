@@ -4,6 +4,9 @@
 # Model weights downloaded at runtime (don't commit the GBs of weights)
 /models/
 
+# Release packaging output
+/dist/
+
 # Env / editor
 .env
 .DS_Store
@@ -12,3 +15,5 @@
 # Runtime logs
 run.log
 *.log
+# curl test artifacts
+/*.json
