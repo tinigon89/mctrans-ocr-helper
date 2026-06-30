@@ -67,6 +67,14 @@
     <option value="cpu">CPU</option>
   </select>
 
+  <label class="field">Detector <span class="restart">· restart to apply</span></label>
+  <select id="detector">
+    <option value="pp-doclayout">PP-DocLayout V3</option>
+    <option value="comic-text">Comic Text Detector</option>
+    <option value="comic-text-bubble">Comic Text &amp; Bubble Detector</option>
+    <option value="anime-text">Anime Text YOLO (N)</option>
+  </select>
+
   <hr/>
 
   <label class="field">Detection threshold <span class="hint">— lower finds more (small) bubbles</span></label>
@@ -87,8 +95,6 @@
     <label for="defaultInpaint">Inpaint by default (return text-removed image)</label>
   </div>
 
-  <div class="ro" style="margin-top:24px">Detector: <b>PP-DocLayout V3</b> (fixed)</div>
-
   <div class="actions">
     <button id="save">Save</button>
     <span id="saved" class="saved">Saved ✓</span>
@@ -108,6 +114,7 @@ async function load() {
   $('ocr').value = c.ocr;
   $('inpainter').value = c.inpainter;
   $('compute').value = c.compute;
+  $('detector').value = c.detector;
   $('detThreshold').value = c.detThreshold;
   $('detThresholdVal').textContent = Number(c.detThreshold).toFixed(2);
   $('direction').value = c.direction;
@@ -122,6 +129,7 @@ $('save').addEventListener('click', async () => {
     ocr: $('ocr').value,
     inpainter: $('inpainter').value,
     compute: $('compute').value,
+    detector: $('detector').value,
     detThreshold: parseFloat($('detThreshold').value),
     direction: $('direction').value,
     defaultInpaint: $('defaultInpaint').checked,

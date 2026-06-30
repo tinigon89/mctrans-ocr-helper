@@ -7,8 +7,9 @@
 //!   POST /config           -> save config (JSON body) to config.toml
 //!   POST /ocr-page (multipart) -> { boxes: OcrBox[], cleanedImage? }
 //!
-//! Pipeline per page: PP-DocLayout V3 (detect) -> chosen OCR per region ->
-//! optional inpaint (chosen engine) -> text-removed PNG.
+//! Pipeline per page: chosen detector (PP-DocLayout V3 / Comic Text / Comic
+//! Text & Bubble / Anime Text YOLO) -> chosen OCR per region -> optional
+//! inpaint (chosen engine) -> text-removed PNG.
 //!
 //! GPL-3.0 (links koharu-ml/koharu-llm). Keep in its own repo, separate from
 //! the proprietary MC-Trans web app (which only talks to it over HTTP).
@@ -33,6 +34,8 @@ use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
 use koharu_ml::aot_inpainting::AotInpainting;
+use koharu_ml::anime_text::AnimeTextDetector;
+use koharu_ml::comic_text_bubble_detector::ComicTextBubbleDetector;
 use koharu_ml::comic_text_detector::ComicTextDetector;
 use koharu_ml::lama::Lama;
 use koharu_ml::manga_ocr::MangaOcr;
@@ -57,6 +60,9 @@ struct Config {
     inpainter: String,
     /// "gpu" | "cpu"                               (restart to apply)
     compute: String,
+    /// text-block detector                         (restart to apply)
+    /// "pp-doclayout" | "comic-text" | "comic-text-bubble" | "anime-text"
+    detector: String,
     /// detection confidence threshold             (live)
     det_threshold: f32,
     /// "auto" | "ltr" | "rtl" reading order        (live)
@@ -71,6 +77,7 @@ impl Default for Config {
             ocr: "paddleocr-vl".into(),
             inpainter: "lama".into(),
             compute: "gpu".into(),
+            detector: "pp-doclayout".into(),
             det_threshold: 0.3,
             direction: "auto".into(),
             default_inpaint: false,
@@ -153,8 +160,10 @@ impl Inpainter {
 /// Loaded models. Candle/llama inference is synchronous, so we serialise
 /// requests behind one mutex (a local single-user helper does one page at a time).
 struct Engines {
-    layout: PPDocLayoutV3,     // text-block DETECTION (fixed)
-    segmenter: ComicTextDetector, // segmentation MASK for inpaint
+    layout: PPDocLayoutV3,        // PP-DocLayout V3 detection (always loaded)
+    segmenter: ComicTextDetector, // segmentation MASK for inpaint (+ "comic-text" detector)
+    bubble: Option<ComicTextBubbleDetector>, // loaded only when detector = comic-text-bubble
+    anime: Option<AnimeTextDetector>,        // loaded only when detector = anime-text
     ocr: Ocr,
     inpainter: Inpainter,
 }
@@ -247,6 +256,27 @@ async fn async_main() -> anyhow::Result<()> {
     let layout = PPDocLayoutV3::load(&runtime, cpu).await.context("load PP-DocLayout V3")?;
     let segmenter = ComicTextDetector::load(&runtime, cpu).await.context("load segmenter")?;
 
+    // Optional detectors — loaded only when selected (each downloads its model).
+    let bubble = if cfg.detector == "comic-text-bubble" {
+        Some(
+            ComicTextBubbleDetector::load(&runtime, cpu)
+                .await
+                .context("load Comic Text & Bubble detector")?,
+        )
+    } else {
+        None
+    };
+    let anime = if cfg.detector == "anime-text" {
+        Some(
+            AnimeTextDetector::load(&runtime, cpu)
+                .await
+                .context("load Anime Text YOLO")?,
+        )
+    } else {
+        None
+    };
+    tracing::info!("detector = {}", cfg.detector);
+
     let inpainter = match cfg.inpainter.as_str() {
         "off" => Inpainter::Off,
         "aot" => Inpainter::Aot(AotInpainting::load(&runtime, cpu).await.context("load AOT")?),
@@ -272,7 +302,7 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::info!("models ready");
 
     let state = AppState {
-        engines: Arc::new(Mutex::new(Engines { layout, segmenter, ocr, inpainter })),
+        engines: Arc::new(Mutex::new(Engines { layout, segmenter, bubble, anime, ocr, inpainter })),
         config: Arc::new(RwLock::new(cfg)),
         root: Arc::new(root),
         device,
@@ -371,7 +401,7 @@ async fn ocr_page(
     let mut engines = s.engines.lock().await;
 
     // 1. Detect text blocks, then OCR each crop.
-    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction)
+    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector)
         .map_err(AppError::internal)?;
     let mut boxes = Vec::new();
     for (bbox, score) in regions {
@@ -394,7 +424,7 @@ async fn ocr_page(
     // 3. Optional inpaint.
     let cleaned_image = if want_inpaint {
         let (mask, region) =
-            inpaint_masks(&engines, &img, cfg.det_threshold).map_err(AppError::internal)?;
+            inpaint_masks(&engines, &img, cfg.det_threshold, &cfg.detector).map_err(AppError::internal)?;
         match engines.inpainter.run(&img, &mask, &region).map_err(AppError::internal)? {
             Some(clean) => Some(to_data_url_png(&clean).map_err(AppError::internal)?),
             None => None,
@@ -407,8 +437,8 @@ async fn ocr_page(
 }
 
 /// Row-bucketed reading-order key. `rtl` flips the horizontal direction.
-fn order_key(r: &koharu_ml::pp_doclayout_v3::LayoutRegion, rtl: bool) -> f32 {
-    let [x1, y1, _, _] = r.bbox;
+fn order_key_bbox(bbox: [f32; 4], rtl: bool) -> f32 {
+    let [x1, y1, _, _] = bbox;
     let row = (y1 / 40.0).floor() * 100_000.0; // ~40px rows, dominates the key
     row + if rtl { -x1 } else { x1 }
 }
@@ -424,28 +454,63 @@ fn to_data_url_png(img: &DynamicImage) -> anyhow::Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Detect text-block pixel bboxes ([x1,y1,x2,y2]) + score, filtered & ordered.
+/// `detector` picks the model: pp-doclayout (default) / comic-text /
+/// comic-text-bubble / anime-text.
 fn detect_regions(
     engines: &Engines,
     img: &DynamicImage,
     threshold: f32,
     direction: &str,
+    detector: &str,
 ) -> anyhow::Result<Vec<([f32; 4], f32)>> {
     let (iw, ih) = (img.width() as f32, img.height() as f32);
-    let mut regions = engines.layout.inference_one(img, threshold)?.regions;
-    match direction {
-        "ltr" => regions.sort_by(|a, b| order_key(a, false).total_cmp(&order_key(b, false))),
-        "rtl" => regions.sort_by(|a, b| order_key(a, true).total_cmp(&order_key(b, true))),
-        _ => regions.sort_by_key(|r| r.order), // "auto" — PP-DocLayout's order
-    }
-    let mut out = Vec::new();
-    for r in &regions {
-        let [x1, y1, x2, y2] = r.bbox;
-        let (rw, rh) = (x2 - x1, y2 - y1);
-        // Skip degenerate / panel-sized regions (likely figures, not text).
-        if rw < 3.0 || rh < 3.0 || (rw * rh) > 0.5 * iw * ih {
-            continue;
+    // PP-DocLayout predicts a reading order we honour for "auto"; the other
+    // detectors don't, so we fall back to a bbox-based sort there.
+    let mut pp_auto = false;
+    let mut out: Vec<([f32; 4], f32)> = match detector {
+        "comic-text" => engines
+            .segmenter
+            .inference(img)?
+            .text_blocks
+            .into_iter()
+            .map(|r| ([r.x, r.y, r.x + r.width, r.y + r.height], r.confidence))
+            .collect(),
+        "comic-text-bubble" => engines
+            .bubble
+            .as_ref()
+            .context("Comic Text & Bubble detector not loaded — restart the helper")?
+            .inference_with_threshold(img, threshold)?
+            .text_blocks
+            .into_iter()
+            .map(|r| ([r.x, r.y, r.x + r.width, r.y + r.height], r.confidence))
+            .collect(),
+        "anime-text" => engines
+            .anime
+            .as_ref()
+            .context("Anime Text YOLO not loaded — restart the helper")?
+            .inference(img)?
+            .regions
+            .into_iter()
+            .map(|r| (r.bbox, r.score))
+            .collect(),
+        _ => {
+            let mut regions = engines.layout.inference_one(img, threshold)?.regions;
+            if direction == "auto" {
+                regions.sort_by_key(|r| r.order);
+                pp_auto = true;
+            }
+            regions.into_iter().map(|r| (r.bbox, r.score)).collect()
         }
-        out.push(([x1, y1, x2, y2], r.score));
+    };
+    // Drop degenerate / panel-sized regions (likely figures, not text).
+    out.retain(|(bbox, _)| {
+        let [x1, y1, x2, y2] = *bbox;
+        let (rw, rh) = (x2 - x1, y2 - y1);
+        rw >= 3.0 && rh >= 3.0 && (rw * rh) <= 0.5 * iw * ih
+    });
+    if !pp_auto {
+        let rtl = direction == "rtl";
+        out.sort_by(|a, b| order_key_bbox(a.0, rtl).total_cmp(&order_key_bbox(b.0, rtl)));
     }
     Ok(out)
 }
@@ -473,6 +538,7 @@ fn inpaint_masks(
     engines: &Engines,
     img: &DynamicImage,
     threshold: f32,
+    detector: &str,
 ) -> anyhow::Result<(DynamicImage, DynamicImage)> {
     // Refined text mask (UNet + DBNet) — cleaner strokes than raw `inference_segmentation`.
     let seg = engines.segmenter.inference(img)?.mask;
@@ -483,7 +549,7 @@ fn inpaint_masks(
     // Constrain to PP-DocLayout text boxes — better coverage than the segmenter's
     // own boxes (catches signs like 保健室) while still excluding hair / art, so
     // those are never erased. Box rectangles double as LaMa's bubble_mask.
-    let regions = detect_regions(engines, img, threshold, "auto")?;
+    let regions = detect_regions(engines, img, threshold, "auto", detector)?;
     let mut region_mask = image::GrayImage::new(w, h);
     for ([x1, y1, x2, y2], _) in &regions {
         let pad = 6.0;
@@ -584,7 +650,7 @@ async fn detect_handler(
     let direction = direction_override.as_deref().unwrap_or(&cfg.direction);
     let engines = s.engines.lock().await;
 
-    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction)
+    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector)
         .map_err(AppError::internal)?;
     let boxes = regions
         .into_iter()
@@ -654,9 +720,12 @@ async fn inpaint_handler(
     mut form: Multipart,
 ) -> Result<Json<InpaintResponse>, AppError> {
     let img = read_image(&mut form).await?;
-    let threshold = s.config.read().await.det_threshold;
+    let (threshold, detector) = {
+        let c = s.config.read().await;
+        (c.det_threshold, c.detector.clone())
+    };
     let engines = s.engines.lock().await;
-    let (mask, region) = inpaint_masks(&engines, &img, threshold).map_err(AppError::internal)?;
+    let (mask, region) = inpaint_masks(&engines, &img, threshold, &detector).map_err(AppError::internal)?;
     match engines.inpainter.run(&img, &mask, &region).map_err(AppError::internal)? {
         Some(clean) => Ok(Json(InpaintResponse {
             cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
