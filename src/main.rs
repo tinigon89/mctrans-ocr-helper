@@ -134,11 +134,17 @@ enum Inpainter {
 }
 
 impl Inpainter {
-    /// Returns None when disabled. mask is reused as the bubble mask.
-    fn run(&self, img: &DynamicImage, mask: &DynamicImage) -> anyhow::Result<Option<DynamicImage>> {
+    /// Returns None when disabled. `mask` = text to erase, `bubble_mask` = the
+    /// region LaMa may fill from.
+    fn run(
+        &self,
+        img: &DynamicImage,
+        mask: &DynamicImage,
+        bubble_mask: &DynamicImage,
+    ) -> anyhow::Result<Option<DynamicImage>> {
         Ok(match self {
-            Inpainter::Lama(m) => Some(m.inference(img, mask, mask)?),
-            Inpainter::Aot(m) => Some(m.inference(img, mask, mask)?),
+            Inpainter::Lama(m) => Some(m.inference(img, mask, bubble_mask)?),
+            Inpainter::Aot(m) => Some(m.inference(img, mask, bubble_mask)?),
             Inpainter::Off => None,
         })
     }
@@ -306,7 +312,12 @@ async fn add_pna_header(req: Request<axum::body::Body>, next: Next) -> Response 
 // ---------------------------------------------------------------------------
 
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true, "name": "mctrans-ocr-helper", "device": s.device }))
+    Json(serde_json::json!({
+        "ok": true,
+        "name": "mctrans-ocr-helper",
+        "version": env!("CARGO_PKG_VERSION"),
+        "device": s.device,
+    }))
 }
 
 async fn get_config(State(s): State<AppState>) -> Json<Config> {
@@ -382,10 +393,9 @@ async fn ocr_page(
 
     // 3. Optional inpaint.
     let cleaned_image = if want_inpaint {
-        let mask = DynamicImage::ImageLuma8(
-            engines.segmenter.inference_segmentation(&img).map_err(AppError::internal)?,
-        );
-        match engines.inpainter.run(&img, &mask).map_err(AppError::internal)? {
+        let (mask, region) =
+            inpaint_masks(&engines, &img, cfg.det_threshold).map_err(AppError::internal)?;
+        match engines.inpainter.run(&img, &mask, &region).map_err(AppError::internal)? {
             Some(clean) => Some(to_data_url_png(&clean).map_err(AppError::internal)?),
             None => None,
         }
@@ -450,6 +460,53 @@ fn ocr_crop(engines: &mut Engines, img: &DynamicImage, bbox: [f32; 4]) -> anyhow
         (y2 - y1) as u32,
     );
     Ok(engines.ocr.recognize(&crop)?.trim().to_string())
+}
+
+/// Build the two masks LaMa wants (koharu-style), both at image resolution:
+///   - text mask: segmentation strokes CONSTRAINED to detected text-block boxes
+///     (so hair / dark sketchy art the segmenter false-positives on is never
+///     erased — only text *inside* a detected text region is removed), dilated.
+///   - region mask: the text-box rectangles, passed as LaMa's `bubble_mask` so
+///     it fills the text from the surrounding region (koharu uses the speech-
+///     bubble segmentation here; the boxes are a good approximation).
+fn inpaint_masks(
+    engines: &Engines,
+    img: &DynamicImage,
+    threshold: f32,
+) -> anyhow::Result<(DynamicImage, DynamicImage)> {
+    // Refined text mask (UNet + DBNet) — cleaner strokes than raw `inference_segmentation`.
+    let seg = engines.segmenter.inference(img)?.mask;
+    let (w, h) = (seg.width(), seg.height());
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    let (sx, sy) = (w as f32 / iw, h as f32 / ih); // mask may differ from page res
+
+    // Constrain to PP-DocLayout text boxes — better coverage than the segmenter's
+    // own boxes (catches signs like 保健室) while still excluding hair / art, so
+    // those are never erased. Box rectangles double as LaMa's bubble_mask.
+    let regions = detect_regions(engines, img, threshold, "auto")?;
+    let mut region_mask = image::GrayImage::new(w, h);
+    for ([x1, y1, x2, y2], _) in &regions {
+        let pad = 6.0;
+        let x0 = (((x1 - pad) * sx).max(0.0)) as u32;
+        let y0 = (((y1 - pad) * sy).max(0.0)) as u32;
+        let x3 = (((x2 + pad) * sx).min(w as f32)) as u32;
+        let y3 = (((y2 + pad) * sy).min(h as f32)) as u32;
+        for yy in y0..y3 {
+            for xx in x0..x3 {
+                region_mask.put_pixel(xx, yy, image::Luma([255]));
+            }
+        }
+    }
+
+    // Keep only text strokes that fall inside a detected text box.
+    let mut text = image::GrayImage::new(w, h);
+    for (x, y, p) in seg.enumerate_pixels() {
+        if p[0] > 127 && region_mask.get_pixel(x, y)[0] > 0 {
+            text.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    let text = imageproc::morphology::dilate(&text, imageproc::distance_transform::Norm::LInf, 2);
+    Ok((DynamicImage::ImageLuma8(text), DynamicImage::ImageLuma8(region_mask)))
 }
 
 /// Pull the `file` field out of a multipart form as a decoded image.
@@ -541,8 +598,10 @@ async fn detect_handler(
         })
         .collect();
 
+    // Same refined mask the inpaint uses (UNet + DBNet), so the LAYERS view
+    // matches what gets erased.
     let mask = DynamicImage::ImageLuma8(
-        engines.segmenter.inference_segmentation(&img).map_err(AppError::internal)?,
+        engines.segmenter.inference(&img).map_err(AppError::internal)?.mask,
     );
     Ok(Json(DetectResponse {
         boxes,
@@ -595,11 +654,10 @@ async fn inpaint_handler(
     mut form: Multipart,
 ) -> Result<Json<InpaintResponse>, AppError> {
     let img = read_image(&mut form).await?;
+    let threshold = s.config.read().await.det_threshold;
     let engines = s.engines.lock().await;
-    let mask = DynamicImage::ImageLuma8(
-        engines.segmenter.inference_segmentation(&img).map_err(AppError::internal)?,
-    );
-    match engines.inpainter.run(&img, &mask).map_err(AppError::internal)? {
+    let (mask, region) = inpaint_masks(&engines, &img, threshold).map_err(AppError::internal)?;
+    match engines.inpainter.run(&img, &mask, &region).map_err(AppError::internal)? {
         Some(clean) => Ok(Json(InpaintResponse {
             cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
         })),

@@ -2155,6 +2155,24 @@ dependencies = [
 
 [[package]]
 name = "imageproc"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "602b4e8a4cc3e98372b766cd184ab532999bc0e839b7469e759511ccabc65d77"
+dependencies = [
+ "ab_glyph",
+ "approx",
+ "getrandom 0.2.17",
+ "image",
+ "itertools 0.12.1",
+ "nalgebra 0.32.6",
+ "num",
+ "rand 0.8.6",
+ "rand_distr 0.4.3",
+ "rayon",
+]
+
+[[package]]
+name = "imageproc"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7b27bc0867dc40df08deb53d6e96342db6e0702e7ae33ed09a4eba33e594b05"
@@ -2164,7 +2182,7 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "itertools 0.14.0",
- "nalgebra",
+ "nalgebra 0.35.0",
  "num",
  "rand 0.10.1",
  "rand_distr 0.6.0",
@@ -2234,6 +2252,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itertools"
@@ -2407,7 +2434,7 @@ dependencies = [
  "clap",
  "cudarc 0.19.8",
  "image",
- "imageproc",
+ "imageproc 0.27.0",
  "koharu-runtime",
  "objc2",
  "objc2-foundation",
@@ -2646,13 +2673,14 @@ dependencies = [
 
 [[package]]
 name = "mctrans-ocr-helper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
  "dirs 5.0.1",
  "image",
+ "imageproc 0.25.1",
  "koharu-llm",
  "koharu-ml",
  "koharu-runtime",
@@ -2817,6 +2845,21 @@ dependencies = [
 
 [[package]]
 name = "nalgebra"
+version = "0.32.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5c17de023a86f59ed79891b2e5d5a94c705dbe904a5b5c9c952ea6221b03e4"
+dependencies = [
+ "approx",
+ "matrixmultiply",
+ "num-complex",
+ "num-rational",
+ "num-traits",
+ "simba 0.8.1",
+ "typenum",
+]
+
+[[package]]
+name = "nalgebra"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adc43a60c217b0c6ff46e47f26911015ad8d2e5a8be1af668c67e370d99a4346"
@@ -2830,7 +2873,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
- "simba",
+ "simba 0.10.0",
  "typenum",
 ]
 
@@ -3589,6 +3632,16 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_distr"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
+dependencies = [
+ "num-traits",
+ "rand 0.8.6",
+]
+
+[[package]]
+name = "rand_distr"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
@@ -4097,6 +4150,15 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safe_arch"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "safe_arch"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
@@ -4353,6 +4415,19 @@ dependencies = [
 
 [[package]]
 name = "simba"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "061507c94fc6ab4ba1c9a0305018408e312e17c041eb63bef8aa726fa33aceae"
+dependencies = [
+ "approx",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "wide 0.7.33",
+]
+
+[[package]]
+name = "simba"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f45c644a9f3a386f9288625d9f0c1e999e1acf07a37df35d0516c7f199d9cb2"
@@ -4360,7 +4435,7 @@ dependencies = [
  "approx",
  "num-complex",
  "num-traits",
- "wide",
+ "wide 1.5.0",
 ]
 
 [[package]]
@@ -5419,12 +5494,22 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wide"
+version = "0.7.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
+dependencies = [
+ "bytemuck",
+ "safe_arch 0.7.4",
+]
+
+[[package]]
+name = "wide"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfdfe6a32973f2d1b268b8895845a8a96cac2f0191e72c27cc929036060dbf89"
 dependencies = [
  "bytemuck",
- "safe_arch",
+ "safe_arch 1.0.0",
 ]
 
 [[package]]
