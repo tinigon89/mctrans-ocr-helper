@@ -1,0 +1,45 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+=== cl.exe check ===
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+=== building ===
+   Compiling ring v0.17.14
+   Compiling aws-lc-sys v0.41.0
+   Compiling regex v1.12.4
+   Compiling onig_sys v69.9.3
+   Compiling candle-kernels v0.9.2 (https://github.com/mayocream/candle?branch=flash-attn#e7e71e18)
+   Compiling bindgen v0.72.1
+   Compiling matchers v0.2.0
+   Compiling candle-flash-attn v0.9.2 (https://github.com/mayocream/candle?branch=flash-attn#e7e71e18)
+   Compiling fancy-regex v0.17.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling utoipa-gen v5.5.0
+   Compiling onig v6.5.3
+   Compiling tokenizers v0.22.2
+   Compiling tokenizers v0.23.1
+   Compiling utoipa v5.5.0
+   Compiling koharu-core v0.61.2 (https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc9)
+   Compiling aws-lc-rs v1.17.0
+   Compiling rustls v0.23.41
+   Compiling rustls-webpki v0.103.13
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling ureq v3.3.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling hf-hub v0.5.0
+   Compiling reqwest-middleware v0.5.2
+   Compiling reqwest-retry v0.9.1
+   Compiling koharu-runtime v0.61.2 (https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc9)
+   Compiling koharu-llm v0.61.2 (https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc9)
+   Compiling candle-core v0.9.2 (https://github.com/mayocream/candle?branch=flash-attn#e7e71e18)
+   Compiling candle-nn v0.9.2 (https://github.com/mayocream/candle?branch=flash-attn#e7e71e18)
+   Compiling candle-transformers v0.9.2 (https://github.com/mayocream/candle?branch=flash-attn#e7e71e18)
+   Compiling koharu-ml v0.61.2 (https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc9)
+   Compiling mctrans-ocr-helper v0.1.0 (H:\Projects\MC-Trans\mctrans-ocr-helper)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 01s

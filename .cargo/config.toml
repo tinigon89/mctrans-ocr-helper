@@ -1,0 +1,12 @@
+# Mirror koharu's build-time env (koharu's own .cargo/config.toml doesn't apply
+# when we consume it as a git dependency).
+#
+# LLAMA_CPP_TAG is only baked in as a string constant (env!) — llama.cpp itself
+# is downloaded prebuilt at RUNTIME and only if the LLM path is used, which this
+# OCR/inpaint helper never touches. So setting the tag is enough to compile.
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+LLAMA_CPP_TAG = "b8935"
+# Only relevant for `--features cuda` builds:
+NVCC_PREPEND_FLAGS = "-std=c++17"
+CUDA_COMPUTE_CAP = "89"   # RTX 4090 / Ada Lovelace (compute 8.9)

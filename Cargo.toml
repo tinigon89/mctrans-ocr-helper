@@ -1,0 +1,53 @@
+[package]
+name = "mctrans-ocr-helper"
+version = "0.1.0"
+edition = "2021"
+# GPL-3.0 because it links koharu-ml (GPL-3.0). Keep this crate in its OWN repo
+# (a fork of / sibling to koharu), NOT inside the proprietary MC-Trans repo.
+license = "GPL-3.0-only"
+
+[dependencies]
+# koharu ML library (Candle-based): detectors + PaddleOCR-VL + inpainting.
+# Depend on the individual workspace member crates by git.
+koharu-ml = { git = "https://github.com/mayocream/koharu", package = "koharu-ml", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
+koharu-llm = { git = "https://github.com/mayocream/koharu", package = "koharu-llm", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
+koharu-runtime = { git = "https://github.com/mayocream/koharu", package = "koharu-runtime", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
+
+# HTTP server
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# image + json
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+nanoid = "0.4"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+toml = "0.8"
+
+# GPU: enable the matching feature from koharu-ml (e.g. "cuda" / "metal").
+# Default build = CPU. For NVIDIA:
+#   cargo build --release --features cuda
+# (requires CUDA toolkit + the candle cuda feature wired through koharu-ml)
+[features]
+default = []
+cuda = ["koharu-ml/cuda"]
+metal = ["koharu-ml/metal"]
+
+# Required for `--features cuda`: koharu builds against forked candle + ug that
+# use cudarc `dynamic-loading`. We consume koharu as a git dep, so its workspace
+# `[patch]` does NOT apply here — we must replicate it, or the crates.io candle
+# pulls cudarc `dynamic-linking` and the build fails ("both dynamic-loading and
+# dynamic-linking active"). These mirror koharu's root Cargo.toml exactly.
+[patch.crates-io]
+candle-transformers = { git = "https://github.com/mayocream/candle", branch = "flash-attn" }
+candle-core = { git = "https://github.com/mayocream/candle", branch = "flash-attn" }
+candle-nn = { git = "https://github.com/mayocream/candle", branch = "flash-attn" }
+candle-flash-attn = { git = "https://github.com/mayocream/candle", branch = "flash-attn" }
+ug = { git = "https://github.com/mayocream/ug", branch = "cuda-dynamic-loading" }
+ug-cuda = { git = "https://github.com/mayocream/ug", branch = "cuda-dynamic-loading" }

@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target/
+
+# Model weights downloaded at runtime (don't commit the GBs of weights)
+/models/
+
+# Env / editor
+.env
+.DS_Store

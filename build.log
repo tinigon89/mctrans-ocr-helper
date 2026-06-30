@@ -1,0 +1,4 @@
+   Compiling bindgen v0.72.1
+   Compiling koharu-llm v0.61.2 (https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc9)
+   Compiling mctrans-ocr-helper v0.1.0 (H:\Projects\MC-Trans\mctrans-ocr-helper)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.25s

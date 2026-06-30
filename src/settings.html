@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MC-Trans OCR Helper — Settings</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0b0b0d; color: #e7e7ea; display: flex; justify-content: center;
+    padding: 40px 16px;
+  }
+  .card { width: 100%; max-width: 560px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #8a8a92; margin: 0 0 24px; font-size: 13px; }
+  .pill { display:inline-block; font-size:11px; padding:1px 8px; border-radius:999px;
+          background:#1d1d22; color:#9a9aa2; vertical-align:middle; margin-left:6px; }
+  .pill.gpu { background:#10331f; color:#5ad17e; }
+  .pill.cpu { background:#33260f; color:#e0a23a; }
+  label.field { display:block; margin: 18px 0 6px; font-weight:600; }
+  .hint { color:#7a7a82; font-weight:400; font-size:12px; }
+  select, input[type=range] { width:100%; }
+  select {
+    background:#141418; color:#e7e7ea; border:1px solid #2a2a31; border-radius:8px;
+    padding:10px 12px; font-size:14px; appearance:none;
+  }
+  .row { display:flex; align-items:center; gap:12px; }
+  .row .val { width:46px; text-align:right; color:#9a9aa2; }
+  .toggle { display:flex; align-items:center; gap:10px; margin-top:18px; }
+  .ro { background:#101014; border:1px dashed #2a2a31; border-radius:8px; padding:10px 12px; color:#9a9aa2; }
+  .restart { color:#e0a23a; font-size:12px; }
+  .actions { margin-top:28px; display:flex; align-items:center; gap:14px; }
+  button {
+    background:#3b4cf0; color:#fff; border:0; border-radius:8px; padding:10px 20px;
+    font-size:14px; font-weight:600; cursor:pointer;
+  }
+  button:disabled { opacity:.5; cursor:default; }
+  .saved { color:#5ad17e; font-size:13px; opacity:0; transition:opacity .2s; }
+  .saved.show { opacity:1; }
+  hr { border:0; border-top:1px solid #1d1d22; margin:24px 0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>MC-Trans OCR Helper <span id="device" class="pill">…</span></h1>
+  <p class="sub">Pick which engine runs each pipeline stage. Engine changes need a restart; the rest apply immediately.</p>
+
+  <label class="field">OCR <span class="restart">· restart to apply</span></label>
+  <select id="ocr">
+    <option value="paddleocr-vl">PaddleOCR-VL 1.6 (GGUF)</option>
+    <option value="manga-ocr">Manga OCR</option>
+    <option value="mit48px">MIT 48px OCR</option>
+  </select>
+
+  <label class="field">Inpainter <span class="restart">· restart to apply</span></label>
+  <select id="inpainter">
+    <option value="lama">LaMa Manga</option>
+    <option value="aot">AOT Inpainting</option>
+    <option value="off">Off</option>
+  </select>
+
+  <label class="field">Compute <span class="restart">· restart to apply</span></label>
+  <select id="compute">
+    <option value="gpu">GPU (CUDA / Metal)</option>
+    <option value="cpu">CPU</option>
+  </select>
+
+  <hr/>
+
+  <label class="field">Detection threshold <span class="hint">— lower finds more (small) bubbles</span></label>
+  <div class="row">
+    <input type="range" id="detThreshold" min="0.1" max="0.9" step="0.05" />
+    <span class="val" id="detThresholdVal">0.30</span>
+  </div>
+
+  <label class="field">Reading order</label>
+  <select id="direction">
+    <option value="auto">Auto (layout model)</option>
+    <option value="ltr">Left → Right</option>
+    <option value="rtl">Right → Left (manga)</option>
+  </select>
+
+  <div class="toggle">
+    <input type="checkbox" id="defaultInpaint" />
+    <label for="defaultInpaint">Inpaint by default (return text-removed image)</label>
+  </div>
+
+  <div class="ro" style="margin-top:24px">Detector: <b>PP-DocLayout V3</b> (fixed)</div>
+
+  <div class="actions">
+    <button id="save">Save</button>
+    <span id="saved" class="saved">Saved ✓</span>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function load() {
+  try {
+    const h = await (await fetch('/health')).json();
+    const d = $('device'); d.textContent = (h.device || '?').toUpperCase();
+    d.className = 'pill ' + (h.device === 'gpu' ? 'gpu' : 'cpu');
+  } catch {}
+  const c = await (await fetch('/config')).json();
+  $('ocr').value = c.ocr;
+  $('inpainter').value = c.inpainter;
+  $('compute').value = c.compute;
+  $('detThreshold').value = c.detThreshold;
+  $('detThresholdVal').textContent = Number(c.detThreshold).toFixed(2);
+  $('direction').value = c.direction;
+  $('defaultInpaint').checked = c.defaultInpaint;
+}
+
+$('detThreshold').addEventListener('input', (e) =>
+  $('detThresholdVal').textContent = Number(e.target.value).toFixed(2));
+
+$('save').addEventListener('click', async () => {
+  const body = {
+    ocr: $('ocr').value,
+    inpainter: $('inpainter').value,
+    compute: $('compute').value,
+    detThreshold: parseFloat($('detThreshold').value),
+    direction: $('direction').value,
+    defaultInpaint: $('defaultInpaint').checked,
+  };
+  $('save').disabled = true;
+  await fetch('/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  $('save').disabled = false;
+  const s = $('saved'); s.classList.add('show');
+  setTimeout(() => s.classList.remove('show'), 1600);
+});
+
+load();
+</script>
+</body>
+</html>
