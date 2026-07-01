@@ -28,7 +28,7 @@ pub fn load(path: &std::path::Path) -> Result<Session> {
 /// Colorize one tile. Scales to a model-friendly size (short side ~576, both
 /// dims a multiple of 32), runs the generator, then upscales the RGB result back
 /// to the tile's native resolution.
-pub fn colorize_tile(session: &Session, tile: &DynamicImage) -> Result<RgbImage> {
+pub fn colorize_tile(session: &mut Session, tile: &DynamicImage) -> Result<RgbImage> {
     let (w0, h0) = (tile.width(), tile.height());
     let (w, h) = fit32(w0, h0, 576);
     let gray = image::imageops::resize(
@@ -47,8 +47,8 @@ pub fn colorize_tile(session: &Session, tile: &DynamicImage) -> Result<RgbImage>
     }
 
     let input = Tensor::from_array(([1usize, 5, hu, wu], data))?;
-    let outputs = session.run(ort::inputs!["input" => input]?)?;
-    let (_shape, out) = outputs["output"].try_extract_raw_tensor::<f32>()?;
+    let outputs = session.run(ort::inputs!["input" => input])?;
+    let (_shape, out) = outputs["output"].try_extract_tensor::<f32>()?;
 
     // out = [1,3,h,w] in ~[-1,1]; de-normalize + clamp to bytes.
     let mut rgb = RgbImage::new(w, h);

@@ -1277,7 +1277,7 @@ async fn colorize_handler(
     ensure_colorizer(&mut engines, s.root.as_path())
         .await
         .map_err(AppError::internal)?;
-    let session = engines.colorizer.as_ref().unwrap();
+    let session = engines.colorizer.as_mut().unwrap();
 
     let (w, h) = (img.width(), img.height());
     let mut out = image::RgbImage::new(w, h);
