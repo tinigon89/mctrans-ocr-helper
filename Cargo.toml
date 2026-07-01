@@ -1,6 +1,6 @@
 [package]
 name = "mctrans-ocr-helper"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 # GPL-3.0 because it links koharu-ml (GPL-3.0). Keep this crate in its OWN repo
 # (a fork of / sibling to koharu), NOT inside the proprietary MC-Trans repo.
@@ -12,6 +12,12 @@ license = "GPL-3.0-only"
 koharu-ml = { git = "https://github.com/mayocream/koharu", package = "koharu-ml", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
 koharu-llm = { git = "https://github.com/mayocream/koharu", package = "koharu-llm", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
 koharu-runtime = { git = "https://github.com/mayocream/koharu", package = "koharu-runtime", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
+
+# ONNX Runtime for the manga colorizer (Mode A). The "cuda" feature registers
+# the CUDA execution provider; colorize.rs falls back to CPU when it can't load.
+ort = { version = "2", features = ["cuda"] }
+# One-time download of the colorizer ONNX (blocking, rustls).
+ureq = { version = "2", features = ["tls"] }
 
 # HTTP server
 axum = { version = "0.8", features = ["multipart"] }

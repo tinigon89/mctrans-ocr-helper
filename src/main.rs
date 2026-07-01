@@ -45,7 +45,14 @@ use koharu_llm::paddleocr_vl::{PaddleOcrVl, PaddleOcrVlTask};
 use koharu_llm::safe::llama_backend::LlamaBackend;
 use koharu_runtime::{ComputePolicy, Runtime};
 
+mod colorize;
+
 const BIND: &str = "127.0.0.1:7842";
+
+// Where the manga colorizer ONNX is fetched from on first use, and its filename
+// in the data dir. (Set COLORIZER_URL to your hosted colorizer.onnx.)
+const COLORIZER_URL: &str = "https://huggingface.co/Tinigon/manga-colorizer-onnx/resolve/main/colorizer.onnx";
+const COLORIZER_FILE: &str = "colorizer.onnx";
 
 // ---------------------------------------------------------------------------
 // Config (persisted to <cache>/config.toml; editable from the settings page)
@@ -284,6 +291,7 @@ struct Engines {
     anime: Option<AnimeTextDetector>,        // loaded only when detector = anime-text
     ocr: Ocr,
     inpainter: Inpainter,
+    colorizer: Option<ort::session::Session>, // lazy: loaded on first /colorize
 }
 
 #[derive(Clone)]
@@ -426,7 +434,7 @@ async fn async_main() -> anyhow::Result<()> {
     let open_url = cfg.open_url.clone();
 
     let state = AppState {
-        engines: Arc::new(Mutex::new(Engines { layout, segmenter, bubble, anime, ocr, inpainter })),
+        engines: Arc::new(Mutex::new(Engines { layout, segmenter, bubble, anime, ocr, inpainter, colorizer: None })),
         config: Arc::new(RwLock::new(cfg)),
         root: Arc::new(root),
         device,
@@ -443,6 +451,7 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/ocr", post(ocr_handler))
         .route("/inpaint", post(inpaint_handler))
         .route("/inpaint-region", post(inpaint_region_handler))
+        .route("/colorize", post(colorize_handler))
         .route("/ocr-page", post(ocr_page))
         .route("/data-dir", get(get_data_dir).post(set_data_dir))
         .route("/update-check", get(update_check))
@@ -1213,6 +1222,75 @@ async fn inpaint_region_handler(
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ColorizeResponse {
+    colorized_image: String,
+}
+
+/// Lazy-load the colorizer ONNX into the engines. Uses a copy next to the exe /
+/// in the data dir when present, otherwise downloads it once into the data dir.
+async fn ensure_colorizer(engines: &mut Engines, root: &std::path::Path) -> anyhow::Result<()> {
+    if engines.colorizer.is_some() {
+        return Ok(());
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let candidates = [
+        Some(root.join(COLORIZER_FILE)),
+        exe_dir.as_ref().map(|d| d.join(COLORIZER_FILE)),
+        exe_dir.as_ref().map(|d| d.join("models").join(COLORIZER_FILE)),
+    ];
+    let mut path = candidates.into_iter().flatten().find(|p| p.exists());
+    if path.is_none() {
+        // Download once into the data dir.
+        std::fs::create_dir_all(root).ok();
+        let dest = root.join(COLORIZER_FILE);
+        tracing::info!("downloading colorizer model → {}", dest.display());
+        let bytes = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<u8>> {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            ureq::get(COLORIZER_URL)
+                .call()?
+                .into_reader()
+                .read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+        .await??;
+        std::fs::write(&dest, &bytes)?;
+        path = Some(dest);
+    }
+    let path = path.unwrap();
+    tracing::info!("loading colorizer {}", path.display());
+    let sess = tokio::task::spawn_blocking(move || colorize::load(&path)).await??;
+    engines.colorizer = Some(sess);
+    Ok(())
+}
+
+/// POST /colorize (file) — AI-colorize a black & white page. Tiles tall webtoons
+/// (smart_tiles) so the fixed model input doesn't squash them, then stitches.
+async fn colorize_handler(
+    State(s): State<AppState>,
+    mut form: Multipart,
+) -> Result<Json<ColorizeResponse>, AppError> {
+    let img = read_image(&mut form).await?;
+    let mut engines = s.engines.lock().await;
+    ensure_colorizer(&mut engines, s.root.as_path())
+        .await
+        .map_err(AppError::internal)?;
+    let session = engines.colorizer.as_ref().unwrap();
+
+    let (w, h) = (img.width(), img.height());
+    let mut out = image::RgbImage::new(w, h);
+    for (y0, y1) in smart_tiles(&img) {
+        let tile = img.crop_imm(0, y0, w, y1 - y0);
+        let colored = colorize::colorize_tile(session, &tile).map_err(AppError::internal)?;
+        image::imageops::overlay(&mut out, &colored, 0, y0 as i64);
+    }
+    Ok(Json(ColorizeResponse {
+        colorized_image: to_data_url_png(&DynamicImage::ImageRgb8(out)).map_err(AppError::internal)?,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -1228,6 +1306,11 @@ impl AppError {
 }
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Log server-side errors so the cause is visible in the helper terminal,
+        // not just the HTTP status the browser sees.
+        if self.0.is_server_error() {
+            tracing::error!("{} -> {}", self.0, self.1);
+        }
         (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
     }
 }
