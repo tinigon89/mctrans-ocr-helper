@@ -170,6 +170,42 @@ fn check_latest() -> anyhow::Result<(String, String)> {
     Ok((current, latest))
 }
 
+/// Delete leftover `.mctrans-ocr-helper.<random>` temp files that self_replace
+/// leaves next to the exe (the old binary, renamed during an update — it can't
+/// be removed while it's the running process, so we sweep them on next launch).
+fn cleanup_update_temp() {
+    let dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        Some(d) => d,
+        None => return,
+    };
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // self_replace names its backups ".<exe stem>.<random>" (leading dot,
+            // so the real "mctrans-ocr-helper.exe" is never matched).
+            if name.starts_with(".mctrans-ocr-helper") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// Relaunch the (now-replaced) exe in a fresh console, then exit this process.
+fn relaunch_and_exit() -> ! {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cmd = std::process::Command::new(&exe);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            cmd.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        let _ = cmd.spawn();
+    }
+    std::process::exit(0);
+}
+
 /// Download the latest release + replace the running exe. Blocking. Returns the
 /// version installed; the running process stays on the old code until restart.
 fn run_self_update() -> anyhow::Result<String> {
@@ -305,6 +341,9 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
+
+    // Sweep any leftover self-update temp files from a previous update.
+    cleanup_update_temp();
 
     let root = resolve_root();
     std::fs::create_dir_all(&root).ok();
@@ -513,7 +552,14 @@ async fn update_apply() -> Result<Json<serde_json::Value>, AppError> {
         .await
         .map_err(AppError::internal)?
         .map_err(AppError::internal)?;
-    Ok(Json(serde_json::json!({ "ok": true, "version": version })))
+    // Auto-restart: let the HTTP response flush, then relaunch the new exe in a
+    // fresh console and exit this (old) process.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        tracing::info!("update installed — restarting");
+        relaunch_and_exit();
+    });
+    Ok(Json(serde_json::json!({ "ok": true, "version": version, "restarting": true })))
 }
 
 async fn settings_page() -> Html<&'static str> {

@@ -100,12 +100,6 @@
     <label for="defaultInpaint">Inpaint by default (return text-removed image)</label>
   </div>
 
-  <div class="toggle">
-    <input type="checkbox" id="openBrowser" />
-    <label for="openBrowser">Open a page in the browser on startup <span class="restart">· restart to apply</span></label>
-  </div>
-  <input type="text" id="openUrl" placeholder="http://127.0.0.1:7842" style="margin-top:6px" />
-
   <hr/>
 
   <label class="field">Data folder <span class="hint">— where models + runtime download (move off a full C: drive)</span></label>
@@ -141,8 +135,6 @@ async function load() {
   $('detThresholdVal').textContent = Number(c.detThreshold).toFixed(2);
   $('direction').value = c.direction;
   $('defaultInpaint').checked = c.defaultInpaint;
-  $('openBrowser').checked = c.openBrowser;
-  $('openUrl').value = c.openUrl || '';
   await loadDataDir();
 }
 
@@ -189,8 +181,6 @@ $('save').addEventListener('click', async () => {
     detThreshold: parseFloat($('detThreshold').value),
     direction: $('direction').value,
     defaultInpaint: $('defaultInpaint').checked,
-    openBrowser: $('openBrowser').checked,
-    openUrl: $('openUrl').value.trim(),
   };
   $('save').disabled = true;
   await fetch('/config', {
@@ -220,7 +210,7 @@ $('updateBtn').addEventListener('click', async () => {
     const res = await fetch('/update', { method: 'POST' });
     const j = await res.json().catch(() => ({}));
     if (res.ok) {
-      $('updateMsg').textContent = `Updated to v${j.version} — restart the helper to apply.`;
+      $('updateMsg').textContent = `Updated to v${j.version} — restarting the helper…`;
       btn.style.display = 'none';
     } else {
       $('updateMsg').textContent = 'Update failed: ' + (j.error || res.status);
