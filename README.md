@@ -6,6 +6,8 @@ Local OCR helper for MC-Trans comic translation. A thin HTTP server wrapping
 - **Detect** text regions — `ComicTextDetector`
 - **Recognise** each region — **PaddleOCR-VL** (manga-capable VLM)
 - **Inpaint** (optional) — **LaMa** removes original text → clean background
+- **Colorize** (optional) — automatic B&W → colour via manga-colorization-v2
+  (ONNX Runtime + **DirectML** GPU); see [Manga colorization](#manga-colorization-directml)
 
 Runs on the user's own machine (GPU via CUDA/Metal, CPU fallback). The web app
 and browser extension call it over loopback, so OCR runs natively instead of in
@@ -18,10 +20,18 @@ WASM. ~80 MB binary; model weights download from Hugging Face on first run.
 ## API
 
 ```
-GET  /health                         -> { ok, name, gpu }
+GET  /health                         -> { ok, name, version, device }
 POST /ocr-page   (multipart)         -> { boxes: OcrBox[], cleanedImage? }
         file=<image bytes>           (required)
         inpaint=true                 (optional → also returns cleanedImage data URL)
+
+# Staged (single-page editor)
+POST /detect         (file)          -> { boxes, mask }         (boxes + segmentation mask)
+POST /ocr            (file, boxes)   -> { boxes }               (OCR the given boxes)
+POST /inpaint        (file)          -> { cleanedImage }        (whole-page text removal)
+POST /inpaint-region (file, boxes)   -> { cleanedImage }        (erase only the given boxes)
+POST /colorize       (file[, size])  -> { colorizedImage }      (AI colorize; size = model
+                                                                 short-side px, default 768)
 ```
 
 `OcrBox` matches MC-Trans's `OCRBox` shape (fractional coords):
@@ -100,6 +110,35 @@ downloads, into the model-cache dir:
 
 End users need **no Python, no CUDA toolkit** — only an NVIDIA driver for the GPU
 path (AMD/Intel get Vulkan OCR + CPU detection; no GPU → all CPU).
+
+## Manga colorization (DirectML)
+
+`POST /colorize` runs **manga-colorization-v2**'s generator (exported to ONNX)
+via **ONNX Runtime** with the **DirectML** execution provider — GPU on any DX12
+card (incl. NVIDIA) with **no CUDA/cuDNN version matching**, and it falls back to
+CPU when DirectML can't initialise. Measured ~1 s/page (GPU) vs ~3 s (CPU).
+
+- Model input: 5-channel `[gray, hint(3)=0, mask(1)=0]`; grayscale in `[0,1]`;
+  output de-normalised `out*0.5+0.5`. Short side scaled to `size` (÷32); tall
+  webtoons are tiled (`smart_tiles`) and stitched.
+- **`ort` uses `load-dynamic`** (see `Cargo.toml`) — pyke's `download-binaries`
+  only ships a static CPU runtime, so real GPU needs an external ONNX Runtime.
+- On first `/colorize`, `ensure_colorizer` fetches three assets (bundled next to
+  the exe / in `models/`, else downloaded to the model-cache dir), points ort at
+  the runtime via `ORT_DYLIB_PATH`, and adds its dir to `PATH` for `DirectML.dll`:
+
+  | File | What | Size |
+  |------|------|------|
+  | `colorizer.onnx` | the model (5ch→3ch U-Net) | ~123 MB |
+  | `onnxruntime.dll` | ONNX Runtime **1.22.x DirectML** build | ~16 MB |
+  | `DirectML.dll` | DirectML runtime | ~18 MB |
+
+  All three are hosted on Hugging Face (`HF_BASE` in `main.rs`). Re-export the
+  model with `scripts/export_colorizer_onnx.py`.
+
+> **Licensing:** manga-colorization-v2 has no explicit upstream license — the
+> exported weights are hosted `other`/unknown with attribution. `onnxruntime.dll`
+> is MIT; `DirectML.dll` is Microsoft-redistributable.
 
 ## MC-Trans integration (web + extension)
 
