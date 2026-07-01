@@ -60,7 +60,7 @@ struct Config {
     inpainter: String,
     /// "gpu" | "cpu"                               (restart to apply)
     compute: String,
-    /// text-block detector                         (restart to apply)
+    /// text-block detector                         (live — lazy-loaded)
     /// "pp-doclayout" | "comic-text" | "comic-text-bubble" | "anime-text"
     detector: String,
     /// detection confidence threshold             (live)
@@ -292,6 +292,10 @@ struct AppState {
     config: Arc<RwLock<Config>>,
     root: Arc<PathBuf>,
     device: &'static str,
+    // Kept so detectors can be loaded lazily when the config's detector changes
+    // (no restart needed — mirrors koharu's on-demand engine loading).
+    runtime: Runtime,
+    cpu: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +430,8 @@ async fn async_main() -> anyhow::Result<()> {
         config: Arc::new(RwLock::new(cfg)),
         root: Arc::new(root),
         device,
+        runtime,
+        cpu,
     };
 
     let app = Router::new()
@@ -598,6 +604,9 @@ async fn ocr_page(
     // Per-request direction (from the web's reading-order setting) overrides config.
     let direction = direction_override.as_deref().unwrap_or(&cfg.direction);
     let mut engines = s.engines.lock().await;
+    ensure_detector(&mut engines, &s.runtime, s.cpu, &cfg.detector)
+        .await
+        .map_err(AppError::internal)?;
 
     // 1. Detect text blocks, then OCR each crop.
     let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector)
@@ -745,7 +754,7 @@ fn detect_tile(
         "comic-text-bubble" => engines
             .bubble
             .as_ref()
-            .context("Comic Text & Bubble detector not loaded — restart the helper")?
+            .context("Comic Text & Bubble detector not loaded")?
             .inference_with_threshold(img, threshold)?
             .text_blocks
             .into_iter()
@@ -754,7 +763,7 @@ fn detect_tile(
         "anime-text" => engines
             .anime
             .as_ref()
-            .context("Anime Text YOLO not loaded — restart the helper")?
+            .context("Anime Text YOLO not loaded")?
             .inference(img)?
             .regions
             .into_iter()
@@ -774,6 +783,29 @@ fn detect_tile(
         rw >= 3.0 && rh >= 3.0 && (rw * rh) <= 0.5 * iw * ih
     });
     Ok((out, pp_auto))
+}
+
+/// Lazily load the detector the config now asks for — no restart (mirrors
+/// koharu). PP-DocLayout + comic-text reuse always-loaded engines; the
+/// bubble / anime models load on first use and stay cached.
+async fn ensure_detector(
+    engines: &mut Engines,
+    runtime: &Runtime,
+    cpu: bool,
+    detector: &str,
+) -> anyhow::Result<()> {
+    match detector {
+        "comic-text-bubble" if engines.bubble.is_none() => {
+            tracing::info!("loading Comic Text & Bubble detector…");
+            engines.bubble = Some(ComicTextBubbleDetector::load(runtime, cpu).await?);
+        }
+        "anime-text" if engines.anime.is_none() => {
+            tracing::info!("loading Anime Text YOLO…");
+            engines.anime = Some(AnimeTextDetector::load(runtime, cpu).await?);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Detect text-block pixel bboxes ([x1,y1,x2,y2]) + score, tiling tall images.
@@ -995,7 +1027,10 @@ async fn detect_handler(
     let (iw, ih) = (img.width() as f32, img.height() as f32);
     let cfg = s.config.read().await.clone();
     let direction = direction_override.as_deref().unwrap_or(&cfg.direction);
-    let engines = s.engines.lock().await;
+    let mut engines = s.engines.lock().await;
+    ensure_detector(&mut engines, &s.runtime, s.cpu, &cfg.detector)
+        .await
+        .map_err(AppError::internal)?;
 
     let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector)
         .map_err(AppError::internal)?;
@@ -1071,7 +1106,10 @@ async fn inpaint_handler(
         let c = s.config.read().await;
         (c.det_threshold, c.detector.clone())
     };
-    let engines = s.engines.lock().await;
+    let mut engines = s.engines.lock().await;
+    ensure_detector(&mut engines, &s.runtime, s.cpu, &detector)
+        .await
+        .map_err(AppError::internal)?;
     match run_inpaint(&engines, &img, threshold, &detector).map_err(AppError::internal)? {
         Some(clean) => Ok(Json(InpaintResponse {
             cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
