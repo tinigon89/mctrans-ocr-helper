@@ -620,11 +620,9 @@ async fn ocr_page(
         });
     }
 
-    // 3. Optional inpaint.
+    // 3. Optional inpaint (tiled for tall webtoons).
     let cleaned_image = if want_inpaint {
-        let (mask, region) =
-            inpaint_masks(&engines, &img, cfg.det_threshold, &cfg.detector).map_err(AppError::internal)?;
-        match engines.inpainter.run(&img, &mask, &region).map_err(AppError::internal)? {
+        match run_inpaint(&engines, &img, cfg.det_threshold, &cfg.detector).map_err(AppError::internal)? {
             Some(clean) => Some(to_data_url_png(&clean).map_err(AppError::internal)?),
             None => None,
         }
@@ -655,16 +653,86 @@ fn to_data_url_png(img: &DynamicImage) -> anyhow::Result<String> {
 /// Detect text-block pixel bboxes ([x1,y1,x2,y2]) + score, filtered & ordered.
 /// `detector` picks the model: pp-doclayout (default) / comic-text /
 /// comic-text-bubble / anime-text.
-fn detect_regions(
+// Very tall images (webtoons) get squashed by the fixed-input detectors /
+// segmenter / LaMa — a 720x14940 strip resizes to near-nothing, so detection is
+// poor and the inpaint mask comes back empty. We slice such images into vertical
+// tiles (each ~normal aspect), run the pipeline per tile, and merge.
+const MAX_TILE_H: u32 = 2048;
+
+/// Per-row "activity" (0 = flat/gutter row, higher = busy with text/art), sampled
+/// across the width for speed. Used to place tile cuts on empty rows.
+fn row_activity(img: &DynamicImage) -> Vec<u32> {
+    let gray = img.to_luma8();
+    let (w, h) = (gray.width(), gray.height());
+    let step = (w / 200).max(1); // sample ~200 columns per row
+    let mut out = vec![0u32; h as usize];
+    for y in 0..h {
+        let (mut sum, mut cnt) = (0u64, 0u64);
+        let mut x = 0;
+        while x < w {
+            sum += gray.get_pixel(x, y)[0] as u64;
+            cnt += 1;
+            x += step;
+        }
+        let mean = (sum / cnt.max(1)) as i32;
+        let mut act = 0u32;
+        let mut x = 0;
+        while x < w {
+            if (gray.get_pixel(x, y)[0] as i32 - mean).abs() > 24 {
+                act += 1;
+            }
+            x += step;
+        }
+        out[y as usize] = act;
+    }
+    out
+}
+
+/// Vertical [y0, y1) tiles covering the image. A single tile when short enough;
+/// otherwise cut near every MAX_TILE_H, snapping each cut to the emptiest row in
+/// a search window so we don't slice through a bubble / line of text.
+fn smart_tiles(img: &DynamicImage) -> Vec<(u32, u32)> {
+    let h = img.height();
+    if h <= MAX_TILE_H {
+        return vec![(0, h)];
+    }
+    let activity = row_activity(img);
+    let window = MAX_TILE_H / 4; // ±512 px search for a gutter around each cut
+    let mut tiles = Vec::new();
+    let mut y = 0u32;
+    while y < h {
+        if h - y <= MAX_TILE_H {
+            tiles.push((y, h));
+            break;
+        }
+        let target = y + MAX_TILE_H;
+        // Keep tiles at least half-height; allow a little past target to reach a gutter.
+        let lo = target.saturating_sub(window).max(y + MAX_TILE_H / 2);
+        let hi = (target + window).min(h - 1);
+        let mut best = target.min(h - 1);
+        let mut best_act = u32::MAX;
+        for cy in lo..=hi {
+            let a = activity[cy as usize];
+            if a < best_act {
+                best_act = a;
+                best = cy;
+            }
+        }
+        tiles.push((y, best));
+        y = best;
+    }
+    tiles
+}
+
+/// Raw detection on ONE image (no tiling) — boxes in that image's pixel coords,
+/// filtered, plus whether PP-DocLayout's model reading order was applied.
+fn detect_tile(
     engines: &Engines,
     img: &DynamicImage,
     threshold: f32,
-    direction: &str,
     detector: &str,
-) -> anyhow::Result<Vec<([f32; 4], f32)>> {
+) -> anyhow::Result<(Vec<([f32; 4], f32)>, bool)> {
     let (iw, ih) = (img.width() as f32, img.height() as f32);
-    // PP-DocLayout predicts a reading order we honour for "auto"; the other
-    // detectors don't, so we fall back to a bbox-based sort there.
     let mut pp_auto = false;
     let mut out: Vec<([f32; 4], f32)> = match detector {
         "comic-text" => engines
@@ -694,10 +762,8 @@ fn detect_regions(
             .collect(),
         _ => {
             let mut regions = engines.layout.inference_one(img, threshold)?.regions;
-            if direction == "auto" {
-                regions.sort_by_key(|r| r.order);
-                pp_auto = true;
-            }
+            regions.sort_by_key(|r| r.order);
+            pp_auto = true;
             regions.into_iter().map(|r| (r.bbox, r.score)).collect()
         }
     };
@@ -707,7 +773,41 @@ fn detect_regions(
         let (rw, rh) = (x2 - x1, y2 - y1);
         rw >= 3.0 && rh >= 3.0 && (rw * rh) <= 0.5 * iw * ih
     });
-    if !pp_auto {
+    Ok((out, pp_auto))
+}
+
+/// Detect text-block pixel bboxes ([x1,y1,x2,y2]) + score, tiling tall images.
+fn detect_regions(
+    engines: &Engines,
+    img: &DynamicImage,
+    threshold: f32,
+    direction: &str,
+    detector: &str,
+) -> anyhow::Result<Vec<([f32; 4], f32)>> {
+    let w = img.width();
+    let tiles = smart_tiles(img);
+    let tiled = tiles.len() > 1;
+    let mut out: Vec<([f32; 4], f32)> = Vec::new();
+    let mut pp_auto = false;
+    for (y0, y1) in tiles {
+        let owned;
+        let tile: &DynamicImage = if tiled {
+            owned = img.crop_imm(0, y0, w, y1 - y0);
+            &owned
+        } else {
+            img
+        };
+        let (mut raw, pa) = detect_tile(engines, tile, threshold, detector)?;
+        pp_auto = pa;
+        for (bbox, _) in raw.iter_mut() {
+            bbox[1] += y0 as f32; // offset into full-image coords
+            bbox[3] += y0 as f32;
+        }
+        out.extend(raw);
+    }
+    // Tiles are appended top→bottom, so PP-DocLayout's per-tile "auto" order is
+    // already globally top→bottom. For ltr/rtl (or unless auto), sort by bbox.
+    if !(pp_auto && direction == "auto") {
         let rtl = direction == "rtl";
         out.sort_by(|a, b| order_key_bbox(a.0, rtl).total_cmp(&order_key_bbox(b.0, rtl)));
     }
@@ -772,6 +872,54 @@ fn inpaint_masks(
     }
     let text = imageproc::morphology::dilate(&text, imageproc::distance_transform::Norm::LInf, 2);
     Ok((DynamicImage::ImageLuma8(text), DynamicImage::ImageLuma8(region_mask)))
+}
+
+/// Inpaint the page, tiling tall webtoons so the segmenter + LaMa don't squash
+/// them. Returns the cleaned image, or None when the inpainter is Off.
+fn run_inpaint(
+    engines: &Engines,
+    img: &DynamicImage,
+    threshold: f32,
+    detector: &str,
+) -> anyhow::Result<Option<DynamicImage>> {
+    if matches!(engines.inpainter, Inpainter::Off) {
+        return Ok(None);
+    }
+    let w = img.width();
+    let tiles = smart_tiles(img);
+    if tiles.len() == 1 {
+        let (mask, region) = inpaint_masks(engines, img, threshold, detector)?;
+        return engines.inpainter.run(img, &mask, &region);
+    }
+    // Inpaint each slice on its own (normal aspect), then paste back.
+    let mut canvas = img.to_rgba8();
+    for (y0, y1) in tiles {
+        let tile = img.crop_imm(0, y0, w, y1 - y0);
+        let (mask, region) = inpaint_masks(engines, &tile, threshold, detector)?;
+        if let Some(cleaned) = engines.inpainter.run(&tile, &mask, &region)? {
+            image::imageops::overlay(&mut canvas, &cleaned.to_rgba8(), 0, y0 as i64);
+        }
+    }
+    Ok(Some(DynamicImage::ImageRgba8(canvas)))
+}
+
+/// Segmentation-mask view (LAYERS debug layer), tiled for tall images and scaled
+/// back to full image resolution.
+fn segment_mask_view(engines: &Engines, img: &DynamicImage) -> anyhow::Result<image::GrayImage> {
+    let (w, h) = (img.width(), img.height());
+    let tiles = smart_tiles(img);
+    if tiles.len() == 1 {
+        return Ok(engines.segmenter.inference(img)?.mask);
+    }
+    let mut full = image::GrayImage::new(w, h);
+    for (y0, y1) in tiles {
+        let tile = img.crop_imm(0, y0, w, y1 - y0);
+        let m = engines.segmenter.inference(&tile)?.mask;
+        // The segmenter mask may be at a different resolution than the tile.
+        let m = image::imageops::resize(&m, w, y1 - y0, image::imageops::FilterType::Triangle);
+        image::imageops::overlay(&mut full, &m, 0, y0 as i64);
+    }
+    Ok(full)
 }
 
 /// Pull the `file` field out of a multipart form as a decoded image.
@@ -863,10 +1011,10 @@ async fn detect_handler(
         })
         .collect();
 
-    // Same refined mask the inpaint uses (UNet + DBNet), so the LAYERS view
-    // matches what gets erased.
+    // Same refined mask the inpaint uses (UNet + DBNet), tiled for tall images,
+    // so the LAYERS view matches what gets erased.
     let mask = DynamicImage::ImageLuma8(
-        engines.segmenter.inference(&img).map_err(AppError::internal)?.mask,
+        segment_mask_view(&engines, &img).map_err(AppError::internal)?,
     );
     Ok(Json(DetectResponse {
         boxes,
@@ -924,8 +1072,7 @@ async fn inpaint_handler(
         (c.det_threshold, c.detector.clone())
     };
     let engines = s.engines.lock().await;
-    let (mask, region) = inpaint_masks(&engines, &img, threshold, &detector).map_err(AppError::internal)?;
-    match engines.inpainter.run(&img, &mask, &region).map_err(AppError::internal)? {
+    match run_inpaint(&engines, &img, threshold, &detector).map_err(AppError::internal)? {
         Some(clean) => Ok(Json(InpaintResponse {
             cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
         })),
