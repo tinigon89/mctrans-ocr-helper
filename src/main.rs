@@ -447,6 +447,9 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/data-dir", get(get_data_dir).post(set_data_dir))
         .route("/update-check", get(update_check))
         .route("/update", post(update_apply))
+        // axum defaults to a 2 MB body limit — raise it so large pages (webp /
+        // hi-res scans routinely exceed 2 MB) don't fail multipart parsing.
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(CorsLayer::very_permissive())
         .layer(middleware::from_fn(add_pna_header))
         .with_state(state);

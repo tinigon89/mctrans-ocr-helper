@@ -1,6 +1,6 @@
 [package]
 name = "mctrans-ocr-helper"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 # GPL-3.0 because it links koharu-ml (GPL-3.0). Keep this crate in its OWN repo
 # (a fork of / sibling to koharu), NOT inside the proprietary MC-Trans repo.
