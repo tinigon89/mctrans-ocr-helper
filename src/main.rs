@@ -148,6 +148,45 @@ fn resolve_root() -> PathBuf {
     default_root()
 }
 
+// ---- Self-update from GitHub Releases ----
+
+const GH_OWNER: &str = "tinigon89";
+const GH_REPO: &str = "mctrans-ocr-helper";
+// Substring of the release asset name to download (mctrans-ocr-helper-windows-cuda.zip).
+const UPDATE_TARGET: &str = "windows-cuda";
+
+/// (current, latest) versions from GitHub. Blocking — run off the async runtime.
+fn check_latest() -> anyhow::Result<(String, String)> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner(GH_OWNER)
+        .repo_name(GH_REPO)
+        .build()?
+        .fetch()?;
+    let latest = releases
+        .first()
+        .map(|r| r.version.clone())
+        .unwrap_or_else(|| current.clone());
+    Ok((current, latest))
+}
+
+/// Download the latest release + replace the running exe. Blocking. Returns the
+/// version installed; the running process stays on the old code until restart.
+fn run_self_update() -> anyhow::Result<String> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner(GH_OWNER)
+        .repo_name(GH_REPO)
+        .bin_name("mctrans-ocr-helper")
+        .target(UPDATE_TARGET)
+        .bin_path_in_archive("mctrans-ocr-helper.exe")
+        .current_version(env!("CARGO_PKG_VERSION"))
+        .show_download_progress(false)
+        .no_confirm(true)
+        .build()?
+        .update()?;
+    Ok(status.version().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Engine wrappers (one enum per swappable stage)
 // ---------------------------------------------------------------------------
@@ -360,6 +399,8 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/inpaint", post(inpaint_handler))
         .route("/ocr-page", post(ocr_page))
         .route("/data-dir", get(get_data_dir).post(set_data_dir))
+        .route("/update-check", get(update_check))
+        .route("/update", post(update_apply))
         .layer(CorsLayer::very_permissive())
         .layer(middleware::from_fn(add_pna_header))
         .with_state(state);
@@ -373,6 +414,15 @@ async fn async_main() -> anyhow::Result<()> {
             tracing::warn!("could not open browser: {e}");
         }
     }
+    // Background update check (non-blocking) — just logs; the user applies it
+    // from the settings page. Network failures are ignored.
+    tokio::spawn(async {
+        if let Ok(Ok((current, latest))) = tokio::task::spawn_blocking(check_latest).await {
+            if self_update::version::bump_is_greater(&current, &latest).unwrap_or(false) {
+                tracing::info!("update available: v{current} -> v{latest} (open settings to update)");
+            }
+        }
+    });
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -447,6 +497,23 @@ async fn set_data_dir(Json(body): Json<DataDirBody>) -> Result<Json<serde_json::
         std::fs::write(&ptr, p).map_err(AppError::internal)?;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn update_check() -> Result<Json<serde_json::Value>, AppError> {
+    let (current, latest) = tokio::task::spawn_blocking(check_latest)
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
+    let available = self_update::version::bump_is_greater(&current, &latest).unwrap_or(false);
+    Ok(Json(serde_json::json!({ "current": current, "latest": latest, "available": available })))
+}
+
+async fn update_apply() -> Result<Json<serde_json::Value>, AppError> {
+    let version = tokio::task::spawn_blocking(run_self_update)
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "version": version })))
 }
 
 async fn settings_page() -> Html<&'static str> {

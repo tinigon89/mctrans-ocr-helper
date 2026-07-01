@@ -47,6 +47,11 @@
   <h1>MC-Trans OCR Helper <span id="device" class="pill">…</span> <span id="version" style="font-size:12px;font-weight:500;color:#64748b;font-family:monospace;"></span></h1>
   <p class="sub">Pick which engine runs each pipeline stage. Engine changes need a restart; the rest apply immediately.</p>
 
+  <div id="updateBanner" style="display:none;margin:12px 0;padding:10px 12px;background:rgba(59,130,246,0.12);border:1px solid rgba(59,130,246,0.35);border-radius:8px;font-size:13px;color:#bfdbfe;">
+    <span id="updateMsg"></span>
+    <button id="updateBtn" style="margin-left:10px;padding:4px 12px;background:#3b82f6;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">Update now</button>
+  </div>
+
   <label class="field">OCR <span class="restart">· restart to apply</span></label>
   <select id="ocr">
     <option value="paddleocr-vl">PaddleOCR-VL 1.6 (GGUF)</option>
@@ -125,6 +130,7 @@ async function load() {
     const d = $('device'); d.textContent = (h.device || '?').toUpperCase();
     d.className = 'pill ' + (h.device === 'gpu' ? 'gpu' : 'cpu');
     if (h.version) $('version').textContent = 'v' + h.version;
+    checkUpdate();
   } catch {}
   const c = await (await fetch('/config')).json();
   $('ocr').value = c.ocr;
@@ -194,6 +200,36 @@ $('save').addEventListener('click', async () => {
   $('save').disabled = false;
   const s = $('saved'); s.classList.add('show');
   setTimeout(() => s.classList.remove('show'), 1600);
+});
+
+async function checkUpdate() {
+  try {
+    const u = await (await fetch('/update-check')).json();
+    if (u && u.available) {
+      $('updateMsg').textContent = `Update available: v${u.current} → v${u.latest}`;
+      $('updateBanner').style.display = 'block';
+    }
+  } catch {}
+}
+
+$('updateBtn').addEventListener('click', async () => {
+  const btn = $('updateBtn');
+  btn.disabled = true; btn.textContent = 'Updating…';
+  $('updateMsg').textContent = 'Downloading update…';
+  try {
+    const res = await fetch('/update', { method: 'POST' });
+    const j = await res.json().catch(() => ({}));
+    if (res.ok) {
+      $('updateMsg').textContent = `Updated to v${j.version} — restart the helper to apply.`;
+      btn.style.display = 'none';
+    } else {
+      $('updateMsg').textContent = 'Update failed: ' + (j.error || res.status);
+      btn.disabled = false; btn.textContent = 'Update now';
+    }
+  } catch (e) {
+    $('updateMsg').textContent = 'Update failed: ' + e;
+    btn.disabled = false; btn.textContent = 'Update now';
+  }
 });
 
 load();
