@@ -1,6 +1,6 @@
 [package]
 name = "mctrans-ocr-helper"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 # GPL-3.0 because it links koharu-ml (GPL-3.0). Keep this crate in its OWN repo
 # (a fork of / sibling to koharu), NOT inside the proprietary MC-Trans repo.
@@ -30,6 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 toml = "0.8"
+open = "5"
 
 # GPU: enable the matching feature from koharu-ml (e.g. "cuda" / "metal").
 # Default build = CPU. For NVIDIA:

@@ -44,7 +44,7 @@
 </head>
 <body>
 <div class="card">
-  <h1>MC-Trans OCR Helper <span id="device" class="pill">…</span></h1>
+  <h1>MC-Trans OCR Helper <span id="device" class="pill">…</span> <span id="version" style="font-size:12px;font-weight:500;color:#64748b;font-family:monospace;"></span></h1>
   <p class="sub">Pick which engine runs each pipeline stage. Engine changes need a restart; the rest apply immediately.</p>
 
   <label class="field">OCR <span class="restart">· restart to apply</span></label>
@@ -95,6 +95,21 @@
     <label for="defaultInpaint">Inpaint by default (return text-removed image)</label>
   </div>
 
+  <div class="toggle">
+    <input type="checkbox" id="openBrowser" />
+    <label for="openBrowser">Open the web app in the browser on startup <span class="restart">· restart to apply</span></label>
+  </div>
+  <input type="text" id="openUrl" placeholder="https://mcai.onl" style="margin-top:6px" />
+
+  <hr/>
+
+  <label class="field">Data folder <span class="hint">— where models + runtime download (move off a full C: drive)</span></label>
+  <div class="row">
+    <input type="text" id="dataDir" placeholder="(default)" style="flex:1" />
+    <button id="saveDataDir">Set</button>
+  </div>
+  <p class="hint" id="dataDirHint" style="margin-top:6px"></p>
+
   <div class="actions">
     <button id="save">Save</button>
     <span id="saved" class="saved">Saved ✓</span>
@@ -109,6 +124,7 @@ async function load() {
     const h = await (await fetch('/health')).json();
     const d = $('device'); d.textContent = (h.device || '?').toUpperCase();
     d.className = 'pill ' + (h.device === 'gpu' ? 'gpu' : 'cpu');
+    if (h.version) $('version').textContent = 'v' + h.version;
   } catch {}
   const c = await (await fetch('/config')).json();
   $('ocr').value = c.ocr;
@@ -119,7 +135,41 @@ async function load() {
   $('detThresholdVal').textContent = Number(c.detThreshold).toFixed(2);
   $('direction').value = c.direction;
   $('defaultInpaint').checked = c.defaultInpaint;
+  $('openBrowser').checked = c.openBrowser;
+  $('openUrl').value = c.openUrl || '';
+  await loadDataDir();
 }
+
+async function loadDataDir() {
+  try {
+    const d = await (await fetch('/data-dir')).json();
+    $('dataDir').value = d.root || '';
+    if (d.envOverride) {
+      $('dataDir').disabled = true;
+      $('saveDataDir').disabled = true;
+      $('dataDirHint').textContent = 'Pinned by MCTRANS_HELPER_ROOT env var: ' + d.envOverride;
+    } else {
+      $('dataDirHint').textContent = 'Default: ' + (d.default || '') + '. Empty = default. Restart to apply.';
+    }
+  } catch {}
+}
+
+$('saveDataDir').addEventListener('click', async () => {
+  $('saveDataDir').disabled = true;
+  try {
+    const res = await fetch('/data-dir', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: $('dataDir').value.trim() }),
+    });
+    const j = await res.json().catch(() => ({}));
+    $('dataDirHint').textContent = res.ok
+      ? 'Saved — restart the helper to move the cache. (Existing files are not moved automatically.)'
+      : ('Failed: ' + (j.error || res.status));
+  } catch (e) {
+    $('dataDirHint').textContent = 'Failed: ' + e;
+  }
+  $('saveDataDir').disabled = false;
+});
 
 $('detThreshold').addEventListener('input', (e) =>
   $('detThresholdVal').textContent = Number(e.target.value).toFixed(2));
@@ -133,6 +183,8 @@ $('save').addEventListener('click', async () => {
     detThreshold: parseFloat($('detThreshold').value),
     direction: $('direction').value,
     defaultInpaint: $('defaultInpaint').checked,
+    openBrowser: $('openBrowser').checked,
+    openUrl: $('openUrl').value.trim(),
   };
   $('save').disabled = true;
   await fetch('/config', {

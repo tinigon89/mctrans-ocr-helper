@@ -69,6 +69,10 @@ struct Config {
     direction: String,
     /// inpaint by default when a request omits the flag (live)
     default_inpaint: bool,
+    /// open the web app in the default browser on startup (restart to apply)
+    open_browser: bool,
+    /// URL opened when open_browser is on
+    open_url: String,
 }
 
 impl Default for Config {
@@ -81,6 +85,8 @@ impl Default for Config {
             det_threshold: 0.3,
             direction: "auto".into(),
             default_inpaint: false,
+            open_browser: true,
+            open_url: "https://mcai.onl".into(),
         }
     }
 }
@@ -103,6 +109,43 @@ fn save_config(root: &Path, cfg: &Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(root).ok();
     std::fs::write(config_path(root), toml::to_string_pretty(cfg)?)?;
     Ok(())
+}
+
+// ---- Data folder (model + runtime cache) location ----
+// Config.toml lives INSIDE this folder, so its location can't live in the
+// config. Resolution order: env var > pointer file next to the exe > default
+// LOCALAPPDATA. The pointer file lets users move the cache off a full C: drive
+// from the settings page without touching env vars.
+
+fn data_dir_pointer() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("data-dir.txt")))
+}
+
+fn default_root() -> PathBuf {
+    dirs::data_local_dir()
+        .expect("no local data dir")
+        .join("mctrans-ocr-helper")
+}
+
+fn env_root_override() -> Option<String> {
+    std::env::var("MCTRANS_HELPER_ROOT").ok().filter(|v| !v.trim().is_empty())
+}
+
+fn resolve_root() -> PathBuf {
+    if let Some(v) = env_root_override() {
+        return PathBuf::from(v.trim());
+    }
+    if let Some(ptr) = data_dir_pointer() {
+        if let Ok(s) = std::fs::read_to_string(&ptr) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return PathBuf::from(s);
+            }
+        }
+    }
+    default_root()
 }
 
 // ---------------------------------------------------------------------------
@@ -224,13 +267,8 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let root = std::env::var("MCTRANS_HELPER_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::data_local_dir()
-                .expect("no local data dir")
-                .join("mctrans-ocr-helper")
-        });
+    let root = resolve_root();
+    std::fs::create_dir_all(&root).ok();
     tracing::info!("model cache: {}", root.display());
 
     let cfg = load_config(&root);
@@ -301,6 +339,10 @@ async fn async_main() -> anyhow::Result<()> {
     };
     tracing::info!("models ready");
 
+    // Capture the browser-open settings before `cfg` is moved into the state.
+    let open_browser = cfg.open_browser;
+    let open_url = cfg.open_url.clone();
+
     let state = AppState {
         engines: Arc::new(Mutex::new(Engines { layout, segmenter, bubble, anime, ocr, inpainter })),
         config: Arc::new(RwLock::new(cfg)),
@@ -317,12 +359,20 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/ocr", post(ocr_handler))
         .route("/inpaint", post(inpaint_handler))
         .route("/ocr-page", post(ocr_page))
+        .route("/data-dir", get(get_data_dir).post(set_data_dir))
         .layer(CorsLayer::very_permissive())
         .layer(middleware::from_fn(add_pna_header))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(BIND).await?;
     tracing::info!("MC-Trans OCR helper on http://{BIND}  (settings: open it in a browser)");
+    // Open the web app in the default browser now that the server is listening.
+    if open_browser && !open_url.trim().is_empty() {
+        tracing::info!("opening {open_url} in the default browser");
+        if let Err(e) = open::that(open_url.trim()) {
+            tracing::warn!("could not open browser: {e}");
+        }
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -360,6 +410,42 @@ async fn post_config(
 ) -> Result<Json<serde_json::Value>, AppError> {
     save_config(&s.root, &new_cfg).map_err(AppError::internal)?;
     *s.config.write().await = new_cfg;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn get_data_dir(State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "root": s.root.display().to_string(),
+        "default": default_root().display().to_string(),
+        // When the env var forces the location, the settings field is read-only.
+        "envOverride": env_root_override(),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct DataDirBody {
+    /// New data folder; empty string reverts to the default location.
+    path: String,
+}
+
+async fn set_data_dir(Json(body): Json<DataDirBody>) -> Result<Json<serde_json::Value>, AppError> {
+    if env_root_override().is_some() {
+        return Err(AppError::bad(anyhow::anyhow!(
+            "data folder is pinned by the MCTRANS_HELPER_ROOT environment variable"
+        )));
+    }
+    let ptr = data_dir_pointer()
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("cannot locate the exe directory")))?;
+    let p = body.path.trim();
+    if p.is_empty() {
+        // Revert to the default location.
+        let _ = std::fs::remove_file(&ptr);
+    } else {
+        // Create it now so an unwritable / invalid path fails here, not on the
+        // next launch. Then persist the pointer next to the exe.
+        std::fs::create_dir_all(p).map_err(|e| AppError::bad(anyhow::anyhow!("cannot use that folder: {e}")))?;
+        std::fs::write(&ptr, p).map_err(AppError::internal)?;
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
