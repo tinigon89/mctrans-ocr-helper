@@ -442,6 +442,7 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/detect", post(detect_handler))
         .route("/ocr", post(ocr_handler))
         .route("/inpaint", post(inpaint_handler))
+        .route("/inpaint-region", post(inpaint_region_handler))
         .route("/ocr-page", post(ocr_page))
         .route("/data-dir", get(get_data_dir).post(set_data_dir))
         .route("/update-check", get(update_check))
@@ -870,6 +871,9 @@ fn inpaint_masks(
     img: &DynamicImage,
     threshold: f32,
     detector: &str,
+    // When Some, constrain to THESE pixel boxes ([x1,y1,x2,y2]) instead of
+    // auto-detecting — used to inpaint a user-selected / custom region.
+    explicit: Option<&[[f32; 4]]>,
 ) -> anyhow::Result<(DynamicImage, DynamicImage)> {
     // Refined text mask (UNet + DBNet) — cleaner strokes than raw `inference_segmentation`.
     let seg = engines.segmenter.inference(img)?.mask;
@@ -877,12 +881,18 @@ fn inpaint_masks(
     let (iw, ih) = (img.width() as f32, img.height() as f32);
     let (sx, sy) = (w as f32 / iw, h as f32 / ih); // mask may differ from page res
 
-    // Constrain to PP-DocLayout text boxes — better coverage than the segmenter's
-    // own boxes (catches signs like 保健室) while still excluding hair / art, so
-    // those are never erased. Box rectangles double as LaMa's bubble_mask.
-    let regions = detect_regions(engines, img, threshold, "auto", detector)?;
+    // Constrain to text boxes — better coverage than the segmenter's own boxes
+    // (catches signs like 保健室) while still excluding hair / art. Box rectangles
+    // double as LaMa's bubble_mask. Explicit boxes override auto-detection.
+    let regions: Vec<[f32; 4]> = match explicit {
+        Some(b) => b.to_vec(),
+        None => detect_regions(engines, img, threshold, "auto", detector)?
+            .into_iter()
+            .map(|(bb, _)| bb)
+            .collect(),
+    };
     let mut region_mask = image::GrayImage::new(w, h);
-    for ([x1, y1, x2, y2], _) in &regions {
+    for [x1, y1, x2, y2] in &regions {
         let pad = 6.0;
         let x0 = (((x1 - pad) * sx).max(0.0)) as u32;
         let y0 = (((y1 - pad) * sy).max(0.0)) as u32;
@@ -920,14 +930,14 @@ fn run_inpaint(
     let w = img.width();
     let tiles = smart_tiles(img);
     if tiles.len() == 1 {
-        let (mask, region) = inpaint_masks(engines, img, threshold, detector)?;
+        let (mask, region) = inpaint_masks(engines, img, threshold, detector, None)?;
         return engines.inpainter.run(img, &mask, &region);
     }
     // Inpaint each slice on its own (normal aspect), then paste back.
     let mut canvas = img.to_rgba8();
     for (y0, y1) in tiles {
         let tile = img.crop_imm(0, y0, w, y1 - y0);
-        let (mask, region) = inpaint_masks(engines, &tile, threshold, detector)?;
+        let (mask, region) = inpaint_masks(engines, &tile, threshold, detector, None)?;
         if let Some(cleaned) = engines.inpainter.run(&tile, &mask, &region)? {
             image::imageops::overlay(&mut canvas, &cleaned.to_rgba8(), 0, y0 as i64);
         }
@@ -952,6 +962,50 @@ fn segment_mask_view(engines: &Engines, img: &DynamicImage) -> anyhow::Result<im
         image::imageops::overlay(&mut full, &m, 0, y0 as i64);
     }
     Ok(full)
+}
+
+/// Inpaint ONLY the given (user-selected / custom) regions. Crops a padded
+/// window around them, segments + inpaints inside it, then composites back —
+/// localized, so it's fast and works on tall pages. `boxes` are pixel
+/// [x1,y1,x2,y2]. Returns the full image with those regions cleaned.
+fn inpaint_region(
+    engines: &Engines,
+    img: &DynamicImage,
+    threshold: f32,
+    detector: &str,
+    boxes: &[[f32; 4]],
+) -> anyhow::Result<Option<DynamicImage>> {
+    if matches!(engines.inpainter, Inpainter::Off) || boxes.is_empty() {
+        return Ok(None);
+    }
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    // Padded union bbox of the selected boxes.
+    let pad = 48.0;
+    let (mut ux0, mut uy0, mut ux1, mut uy1) = (f32::MAX, f32::MAX, 0.0f32, 0.0f32);
+    for [x0, y0, x1, y1] in boxes {
+        ux0 = ux0.min(*x0);
+        uy0 = uy0.min(*y0);
+        ux1 = ux1.max(*x1);
+        uy1 = uy1.max(*y1);
+    }
+    let cx0 = (ux0 - pad).max(0.0);
+    let cy0 = (uy0 - pad).max(0.0);
+    let cw = ((ux1 + pad).min(iw) - cx0).max(1.0) as u32;
+    let cheight = ((uy1 + pad).min(ih) - cy0).max(1.0) as u32;
+    let crop = img.crop_imm(cx0 as u32, cy0 as u32, cw, cheight);
+    // Boxes offset into crop coordinates.
+    let local: Vec<[f32; 4]> = boxes
+        .iter()
+        .map(|[a, b, c, d]| [a - cx0, b - cy0, c - cx0, d - cy0])
+        .collect();
+    let (mask, region) = inpaint_masks(engines, &crop, threshold, detector, Some(&local))?;
+    let cleaned = match engines.inpainter.run(&crop, &mask, &region)? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let mut canvas = img.to_rgba8();
+    image::imageops::overlay(&mut canvas, &cleaned.to_rgba8(), cx0 as i64, cy0 as i64);
+    Ok(Some(DynamicImage::ImageRgba8(canvas)))
 }
 
 /// Pull the `file` field out of a multipart form as a decoded image.
@@ -1115,6 +1169,44 @@ async fn inpaint_handler(
             cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
         })),
         None => Err(AppError::bad("inpainter is set to Off")),
+    }
+}
+
+/// POST /inpaint-region (file + boxes JSON) — erase text in the given user boxes
+/// only (segment within them, inpaint, composite back). Returns the full page.
+async fn inpaint_region_handler(
+    State(s): State<AppState>,
+    mut form: Multipart,
+) -> Result<Json<InpaintResponse>, AppError> {
+    let mut img_bytes: Option<Vec<u8>> = None;
+    let mut boxes_json: Option<String> = None;
+    while let Some(field) = form.next_field().await.map_err(AppError::bad)? {
+        match field.name() {
+            Some("file") => img_bytes = Some(field.bytes().await.map_err(AppError::bad)?.to_vec()),
+            Some("boxes") => boxes_json = Some(field.text().await.map_err(AppError::bad)?),
+            _ => {}
+        }
+    }
+    let bytes = img_bytes.ok_or_else(|| AppError::bad("missing 'file' field"))?;
+    let img = image::load_from_memory(&bytes).map_err(AppError::bad)?;
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    let boxes_in: Vec<BoxIn> =
+        serde_json::from_str(&boxes_json.ok_or_else(|| AppError::bad("missing 'boxes' field"))?)
+            .map_err(AppError::bad)?;
+    let px: Vec<[f32; 4]> = boxes_in
+        .iter()
+        .map(|b| [b.x * iw, b.y * ih, (b.x + b.width) * iw, (b.y + b.height) * ih])
+        .collect();
+    let (threshold, detector) = {
+        let c = s.config.read().await;
+        (c.det_threshold, c.detector.clone())
+    };
+    let engines = s.engines.lock().await;
+    match inpaint_region(&engines, &img, threshold, &detector, &px).map_err(AppError::internal)? {
+        Some(clean) => Ok(Json(InpaintResponse {
+            cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
+        })),
+        None => Err(AppError::bad("inpainter is Off or no regions given")),
     }
 }
 
