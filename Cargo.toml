@@ -15,7 +15,7 @@ koharu-runtime = { git = "https://github.com/mayocream/koharu", package = "kohar
 
 # ONNX Runtime for the manga colorizer (Mode A). The "cuda" feature registers
 # the CUDA execution provider; colorize.rs falls back to CPU when it can't load.
-ort = { version = "=2.0.0-rc.10", features = ["cuda"] }
+ort = { version = "=2.0.0-rc.10", features = ["directml", "load-dynamic"] }
 # One-time download of the colorizer ONNX (blocking, rustls).
 ureq = { version = "2", features = ["tls"] }
 

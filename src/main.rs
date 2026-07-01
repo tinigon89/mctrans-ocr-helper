@@ -49,10 +49,15 @@ mod colorize;
 
 const BIND: &str = "127.0.0.1:7842";
 
-// Where the manga colorizer ONNX is fetched from on first use, and its filename
-// in the data dir. (Set COLORIZER_URL to your hosted colorizer.onnx.)
-const COLORIZER_URL: &str = "https://huggingface.co/Tinigon/manga-colorizer-onnx/resolve/main/colorizer.onnx";
+// Colorizer assets, fetched on first /colorize into the data dir (or read from
+// next to the exe if bundled). We use ort with `load-dynamic`, so the ONNX
+// Runtime DirectML build (onnxruntime.dll 1.22.x) + DirectML.dll ship as data
+// too — DirectML gives GPU on any DX12 GPU with no CUDA/cuDNN version matching.
+// Host all three in the same HF repo as colorizer.onnx.
+const HF_BASE: &str = "https://huggingface.co/Tinigon/manga-colorizer-onnx/resolve/main";
 const COLORIZER_FILE: &str = "colorizer.onnx";
+const ORT_DLL_FILE: &str = "onnxruntime.dll";
+const DIRECTML_DLL_FILE: &str = "DirectML.dll";
 
 // ---------------------------------------------------------------------------
 // Config (persisted to <cache>/config.toml; editable from the settings page)
@@ -1228,40 +1233,58 @@ struct ColorizeResponse {
     colorized_image: String,
 }
 
-/// Lazy-load the colorizer ONNX into the engines. Uses a copy next to the exe /
-/// in the data dir when present, otherwise downloads it once into the data dir.
+/// Ensure `name` is available: return a copy next to the exe (or exe/models) if
+/// bundled, otherwise download it once from `HF_BASE/name` into the data dir.
+async fn ensure_asset(root: &std::path::Path, name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    for cand in [
+        exe_dir.as_ref().map(|d| d.join(name)),
+        exe_dir.as_ref().map(|d| d.join("models").join(name)),
+        Some(root.join(name)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if cand.exists() {
+            return Ok(cand);
+        }
+    }
+    std::fs::create_dir_all(root).ok();
+    let dest = root.join(name);
+    let url = format!("{HF_BASE}/{name}");
+    tracing::info!("downloading {name} → {}", dest.display());
+    let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        ureq::get(&url).call()?.into_reader().read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+    .await??;
+    std::fs::write(&dest, &bytes)?;
+    Ok(dest)
+}
+
+/// Lazy-load the colorizer. Ensures the ONNX Runtime DirectML DLLs + the model
+/// (bundled next to the exe, or downloaded to the data dir), points `ort` at the
+/// runtime via ORT_DYLIB_PATH, and makes DirectML.dll discoverable, then loads.
 async fn ensure_colorizer(engines: &mut Engines, root: &std::path::Path) -> anyhow::Result<()> {
     if engines.colorizer.is_some() {
         return Ok(());
     }
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let candidates = [
-        Some(root.join(COLORIZER_FILE)),
-        exe_dir.as_ref().map(|d| d.join(COLORIZER_FILE)),
-        exe_dir.as_ref().map(|d| d.join("models").join(COLORIZER_FILE)),
-    ];
-    let mut path = candidates.into_iter().flatten().find(|p| p.exists());
-    if path.is_none() {
-        // Download once into the data dir.
-        std::fs::create_dir_all(root).ok();
-        let dest = root.join(COLORIZER_FILE);
-        tracing::info!("downloading colorizer model → {}", dest.display());
-        let bytes = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<u8>> {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            ureq::get(COLORIZER_URL)
-                .call()?
-                .into_reader()
-                .read_to_end(&mut buf)?;
-            Ok(buf)
-        })
-        .await??;
-        std::fs::write(&dest, &bytes)?;
-        path = Some(dest);
+    let ort_dll = ensure_asset(root, ORT_DLL_FILE).await?;
+    let _dml_dll = ensure_asset(root, DIRECTML_DLL_FILE).await?; // loaded by onnxruntime
+    let onnx = ensure_asset(root, COLORIZER_FILE).await?;
+
+    // Point ort (load-dynamic) at our onnxruntime.dll, and add its directory to
+    // PATH so the DirectML EP can find DirectML.dll sitting next to it.
+    std::env::set_var("ORT_DYLIB_PATH", &ort_dll);
+    if let Some(dir) = ort_dll.parent() {
+        let prev = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{};{}", dir.display(), prev));
     }
-    let path = path.unwrap();
-    tracing::info!("loading colorizer {}", path.display());
-    let sess = tokio::task::spawn_blocking(move || colorize::load(&path)).await??;
+
+    tracing::info!("loading colorizer {}", onnx.display());
+    let sess = tokio::task::spawn_blocking(move || colorize::load(&onnx)).await??;
     engines.colorizer = Some(sess);
     Ok(())
 }
