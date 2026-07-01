@@ -69,9 +69,9 @@ struct Config {
     direction: String,
     /// inpaint by default when a request omits the flag (live)
     default_inpaint: bool,
-    /// open the web app in the default browser on startup (restart to apply)
+    /// open a page in the default browser on startup (restart to apply)
     open_browser: bool,
-    /// URL opened when open_browser is on
+    /// URL opened when open_browser is on (default = the helper settings page)
     open_url: String,
 }
 
@@ -86,7 +86,7 @@ impl Default for Config {
             direction: "auto".into(),
             default_inpaint: false,
             open_browser: true,
-            open_url: "https://mcai.onl".into(),
+            open_url: "http://127.0.0.1:7842".into(),
         }
     }
 }
