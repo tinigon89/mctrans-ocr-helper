@@ -38,9 +38,9 @@ pub fn load(path: &std::path::Path) -> Result<Session> {
 /// Colorize one tile. Scales to a model-friendly size (short side ~576, both
 /// dims a multiple of 32), runs the generator, then upscales the RGB result back
 /// to the tile's native resolution.
-pub fn colorize_tile(session: &mut Session, tile: &DynamicImage) -> Result<RgbImage> {
+pub fn colorize_tile(session: &mut Session, tile: &DynamicImage, short: u32) -> Result<RgbImage> {
     let (w0, h0) = (tile.width(), tile.height());
-    let (w, h) = fit32(w0, h0, 576);
+    let (w, h) = fit32(w0, h0, short);
     let gray = image::imageops::resize(
         &tile.to_luma8(),
         w,
@@ -112,7 +112,7 @@ mod tests {
         let mut sess = load(std::path::Path::new(&onnx)).expect("load onnx");
         let img = image::open(&img_path).expect("open image");
         let t = std::time::Instant::now();
-        let out = colorize_tile(&mut sess, &img).expect("colorize");
+        let out = colorize_tile(&mut sess, &img, 576).expect("colorize");
         eprintln!(
             "colorized {}x{} -> {}x{} in {:?}",
             img.width(), img.height(), out.width(), out.height(), t.elapsed()

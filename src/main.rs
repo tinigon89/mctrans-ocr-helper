@@ -1289,13 +1289,28 @@ async fn ensure_colorizer(engines: &mut Engines, root: &std::path::Path) -> anyh
     Ok(())
 }
 
-/// POST /colorize (file) — AI-colorize a black & white page. Tiles tall webtoons
-/// (smart_tiles) so the fixed model input doesn't squash them, then stitches.
+/// POST /colorize (file[, size]) — AI-colorize a black & white page. `size` is
+/// the model input's short-side in px (higher = sharper + slower; default 768).
+/// Tiles tall webtoons (smart_tiles) so the fixed model input doesn't squash
+/// them, then stitches.
 async fn colorize_handler(
     State(s): State<AppState>,
     mut form: Multipart,
 ) -> Result<Json<ColorizeResponse>, AppError> {
-    let img = read_image(&mut form).await?;
+    let mut img_bytes: Option<Vec<u8>> = None;
+    let mut size: Option<u32> = None;
+    while let Some(field) = form.next_field().await.map_err(AppError::bad)? {
+        match field.name() {
+            Some("file") => img_bytes = Some(field.bytes().await.map_err(AppError::bad)?.to_vec()),
+            Some("size") => size = field.text().await.map_err(AppError::bad)?.trim().parse().ok(),
+            _ => {}
+        }
+    }
+    let bytes = img_bytes.ok_or_else(|| AppError::bad("missing 'file' field"))?;
+    let img = image::load_from_memory(&bytes).map_err(AppError::bad)?;
+    // Clamp to a sane range; fit32 rounds to a multiple of 32.
+    let short = size.unwrap_or(768).clamp(384, 1536);
+
     let mut engines = s.engines.lock().await;
     ensure_colorizer(&mut engines, s.root.as_path())
         .await
@@ -1306,7 +1321,7 @@ async fn colorize_handler(
     let mut out = image::RgbImage::new(w, h);
     for (y0, y1) in smart_tiles(&img) {
         let tile = img.crop_imm(0, y0, w, y1 - y0);
-        let colored = colorize::colorize_tile(session, &tile).map_err(AppError::internal)?;
+        let colored = colorize::colorize_tile(session, &tile, short).map_err(AppError::internal)?;
         image::imageops::overlay(&mut out, &colored, 0, y0 as i64);
     }
     Ok(Json(ColorizeResponse {
