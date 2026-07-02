@@ -372,6 +372,16 @@ async fn async_main() -> anyhow::Result<()> {
     let cpu = cfg.compute == "cpu";
     let device = if cpu { "cpu" } else { "gpu" };
 
+    // Claim the port BEFORE loading any model. A duplicate instance used to
+    // load ~3 GB of models into VRAM first and only then die on the bind —
+    // now it exits immediately with a clear message and zero GPU cost.
+    let listener = tokio::net::TcpListener::bind(BIND).await.with_context(|| {
+        format!(
+            "cannot listen on {BIND} — another MC-Trans OCR helper instance is \
+             probably already running (check the tray / task manager)"
+        )
+    })?;
+
     let runtime = Runtime::new(
         root.clone(),
         if cpu { ComputePolicy::CpuOnly } else { ComputePolicy::PreferGpu },
@@ -470,7 +480,7 @@ async fn async_main() -> anyhow::Result<()> {
         .layer(middleware::from_fn(add_pna_header))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(BIND).await?;
+    // (port already claimed up top, before the models loaded)
     tracing::info!("MC-Trans OCR helper on http://{BIND}  (settings: open it in a browser)");
     // Open the web app in the default browser now that the server is listening.
     if open_browser && !open_url.trim().is_empty() {
