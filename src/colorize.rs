@@ -35,26 +35,56 @@ pub fn load(path: &std::path::Path) -> Result<Session> {
     Ok(session)
 }
 
-/// Colorize one tile. Scales to a model-friendly size (short side ~576, both
-/// dims a multiple of 32), runs the generator, then upscales the RGB result back
-/// to the tile's native resolution.
-pub fn colorize_tile(session: &mut Session, tile: &DynamicImage, short: u32) -> Result<RgbImage> {
-    let (w0, h0) = (tile.width(), tile.height());
-    let (w, h) = fit32(w0, h0, short);
-    let gray = image::imageops::resize(
-        &tile.to_luma8(),
-        w,
-        h,
-        image::imageops::FilterType::Triangle,
-    );
-
-    // NCHW [1,5,h,w]: ch0 = gray/255; ch1..4 = 0.
+/// Run the FFDNet denoiser ([1,3,H,W] in/out, [0,1]) on a resized RGB tile and
+/// return the denoised grayscale (luma) plane. Cleans screentones so the
+/// colorizer isn't confused by dot patterns.
+fn denoise_gray(session: &mut Session, rgb: &RgbImage, w: u32, h: u32) -> Result<Vec<f32>> {
     let (hu, wu) = (h as usize, w as usize);
     let plane = hu * wu;
-    let mut data = vec![0f32; 5 * plane];
-    for (x, y, p) in gray.enumerate_pixels() {
-        data[(y as usize) * wu + (x as usize)] = p[0] as f32 / 255.0;
+    let mut data = vec![0f32; 3 * plane];
+    for (x, y, p) in rgb.enumerate_pixels() {
+        let i = (y as usize) * wu + (x as usize);
+        data[i] = p[0] as f32 / 255.0;
+        data[plane + i] = p[1] as f32 / 255.0;
+        data[2 * plane + i] = p[2] as f32 / 255.0;
     }
+    let input = Tensor::from_array(([1usize, 3, hu, wu], data))?;
+    let out = session.run(ort::inputs!["input" => input])?;
+    let (_s, o) = out["output"].try_extract_tensor::<f32>()?;
+    let mut gray = vec![0f32; plane];
+    for i in 0..plane {
+        gray[i] = 0.299 * o[i] + 0.587 * o[plane + i] + 0.114 * o[2 * plane + i];
+    }
+    Ok(gray)
+}
+
+/// Colorize one tile. Scales to a model-friendly size (short side ~576, both
+/// dims a multiple of 32), runs the generator, then upscales the RGB result back
+/// to the tile's native resolution. When `denoiser` is given, an FFDNet
+/// denoise pass runs first (cleaner on screentoned scans).
+pub fn colorize_tile(
+    session: &mut Session,
+    denoiser: Option<&mut Session>,
+    tile: &DynamicImage,
+    short: u32,
+) -> Result<RgbImage> {
+    let (w0, h0) = (tile.width(), tile.height());
+    let (w, h) = fit32(w0, h0, short);
+    let (hu, wu) = (h as usize, w as usize);
+    let plane = hu * wu;
+
+    // ch0 grayscale in [0,1]: from the FFDNet denoise pass, or plain luma.
+    let gray: Vec<f32> = if let Some(dn) = denoiser {
+        let rgb = image::imageops::resize(&tile.to_rgb8(), w, h, image::imageops::FilterType::Triangle);
+        denoise_gray(dn, &rgb, w, h)?
+    } else {
+        let g = image::imageops::resize(&tile.to_luma8(), w, h, image::imageops::FilterType::Triangle);
+        g.pixels().map(|p| p[0] as f32 / 255.0).collect()
+    };
+
+    // NCHW [1,5,h,w]: ch0 = gray; ch1..4 = 0.
+    let mut data = vec![0f32; 5 * plane];
+    data[..plane].copy_from_slice(&gray);
 
     let input = Tensor::from_array(([1usize, 5, hu, wu], data))?;
     let outputs = session.run(ort::inputs!["input" => input])?;
@@ -112,7 +142,7 @@ mod tests {
         let mut sess = load(std::path::Path::new(&onnx)).expect("load onnx");
         let img = image::open(&img_path).expect("open image");
         let t = std::time::Instant::now();
-        let out = colorize_tile(&mut sess, &img, 576).expect("colorize");
+        let out = colorize_tile(&mut sess, None, &img, 576).expect("colorize");
         eprintln!(
             "colorized {}x{} -> {}x{} in {:?}",
             img.width(), img.height(), out.width(), out.height(), t.elapsed()

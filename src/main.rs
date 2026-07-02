@@ -56,6 +56,7 @@ const BIND: &str = "127.0.0.1:7842";
 // Host all three in the same HF repo as colorizer.onnx.
 const HF_BASE: &str = "https://huggingface.co/Tinigon/manga-colorizer-onnx/resolve/main";
 const COLORIZER_FILE: &str = "colorizer.onnx";
+const DENOISER_FILE: &str = "denoiser.onnx"; // FFDNet, optional pre-pass
 const ORT_DLL_FILE: &str = "onnxruntime.dll";
 const DIRECTML_DLL_FILE: &str = "DirectML.dll";
 
@@ -297,6 +298,7 @@ struct Engines {
     ocr: Ocr,
     inpainter: Inpainter,
     colorizer: Option<ort::session::Session>, // lazy: loaded on first /colorize
+    denoiser: Option<ort::session::Session>,  // lazy: loaded on first denoise=true
 }
 
 #[derive(Clone)]
@@ -439,7 +441,7 @@ async fn async_main() -> anyhow::Result<()> {
     let open_url = cfg.open_url.clone();
 
     let state = AppState {
-        engines: Arc::new(Mutex::new(Engines { layout, segmenter, bubble, anime, ocr, inpainter, colorizer: None })),
+        engines: Arc::new(Mutex::new(Engines { layout, segmenter, bubble, anime, ocr, inpainter, colorizer: None, denoiser: None })),
         config: Arc::new(RwLock::new(cfg)),
         root: Arc::new(root),
         device,
@@ -1289,8 +1291,22 @@ async fn ensure_colorizer(engines: &mut Engines, root: &std::path::Path) -> anyh
     Ok(())
 }
 
-/// POST /colorize (file[, size]) — AI-colorize a black & white page. `size` is
-/// the model input's short-side in px (higher = sharper + slower; default 768).
+/// Lazy-load the FFDNet denoiser. Assumes ensure_colorizer already set up the
+/// ONNX Runtime (ORT_DYLIB_PATH + PATH); only the model file is needed here.
+async fn ensure_denoiser(engines: &mut Engines, root: &std::path::Path) -> anyhow::Result<()> {
+    if engines.denoiser.is_some() {
+        return Ok(());
+    }
+    let onnx = ensure_asset(root, DENOISER_FILE).await?;
+    tracing::info!("loading denoiser {}", onnx.display());
+    let sess = tokio::task::spawn_blocking(move || colorize::load(&onnx)).await??;
+    engines.denoiser = Some(sess);
+    Ok(())
+}
+
+/// POST /colorize (file[, size, denoise]) — AI-colorize a black & white page.
+/// `size` = model input short-side px (higher = sharper + slower; default 768).
+/// `denoise=true` runs an FFDNet pre-pass (cleaner on screentoned scans).
 /// Tiles tall webtoons (smart_tiles) so the fixed model input doesn't squash
 /// them, then stitches.
 async fn colorize_handler(
@@ -1299,10 +1315,12 @@ async fn colorize_handler(
 ) -> Result<Json<ColorizeResponse>, AppError> {
     let mut img_bytes: Option<Vec<u8>> = None;
     let mut size: Option<u32> = None;
+    let mut denoise = false;
     while let Some(field) = form.next_field().await.map_err(AppError::bad)? {
         match field.name() {
             Some("file") => img_bytes = Some(field.bytes().await.map_err(AppError::bad)?.to_vec()),
             Some("size") => size = field.text().await.map_err(AppError::bad)?.trim().parse().ok(),
+            Some("denoise") => denoise = field.text().await.map_err(AppError::bad)?.trim() == "true",
             _ => {}
         }
     }
@@ -1315,13 +1333,23 @@ async fn colorize_handler(
     ensure_colorizer(&mut engines, s.root.as_path())
         .await
         .map_err(AppError::internal)?;
-    let session = engines.colorizer.as_mut().unwrap();
+    if denoise {
+        ensure_denoiser(&mut engines, s.root.as_path())
+            .await
+            .map_err(AppError::internal)?;
+    }
+    // Disjoint borrows of two Engines fields (colorizer + denoiser). Deref the
+    // MutexGuard once so the borrow checker can split the two field borrows.
+    let engines_ref: &mut Engines = &mut engines;
+    let colorizer = engines_ref.colorizer.as_mut().unwrap();
+    let mut denoiser = if denoise { engines_ref.denoiser.as_mut() } else { None };
 
     let (w, h) = (img.width(), img.height());
     let mut out = image::RgbImage::new(w, h);
     for (y0, y1) in smart_tiles(&img) {
         let tile = img.crop_imm(0, y0, w, y1 - y0);
-        let colored = colorize::colorize_tile(session, &tile, short).map_err(AppError::internal)?;
+        let colored = colorize::colorize_tile(colorizer, denoiser.as_deref_mut(), &tile, short)
+            .map_err(AppError::internal)?;
         image::imageops::overlay(&mut out, &colored, 0, y0 as i64);
     }
     Ok(Json(ColorizeResponse {

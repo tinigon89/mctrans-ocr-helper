@@ -30,8 +30,9 @@ POST /detect         (file)          -> { boxes, mask }         (boxes + segment
 POST /ocr            (file, boxes)   -> { boxes }               (OCR the given boxes)
 POST /inpaint        (file)          -> { cleanedImage }        (whole-page text removal)
 POST /inpaint-region (file, boxes)   -> { cleanedImage }        (erase only the given boxes)
-POST /colorize       (file[, size])  -> { colorizedImage }      (AI colorize; size = model
-                                                                 short-side px, default 768)
+POST /colorize (file[, size, denoise]) -> { colorizedImage }    (AI colorize; size = model
+                                                                 short-side px, default 768;
+                                                                 denoise=true → FFDNet pre-pass)
 ```
 
 `OcrBox` matches MC-Trans's `OCRBox` shape (fractional coords):
@@ -130,6 +131,7 @@ CPU when DirectML can't initialise. Measured ~1 s/page (GPU) vs ~3 s (CPU).
   | File | What | Size |
   |------|------|------|
   | `colorizer.onnx` | the model (5ch→3ch U-Net) | ~123 MB |
+  | `denoiser.onnx` | FFDNet denoise pre-pass (optional, `denoise=true`) | ~3 MB |
   | `onnxruntime.dll` | ONNX Runtime **1.22.x DirectML** build | ~16 MB |
   | `DirectML.dll` | DirectML runtime | ~18 MB |
 
