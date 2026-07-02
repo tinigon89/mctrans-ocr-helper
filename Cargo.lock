@@ -2855,11 +2855,12 @@ dependencies = [
 
 [[package]]
 name = "mctrans-ocr-helper"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "cudarc 0.19.8",
  "dirs 5.0.1",
  "image",
  "imageproc 0.25.1",

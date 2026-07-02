@@ -311,6 +311,9 @@ struct AppState {
     // (no restart needed — mirrors koharu's on-demand engine loading).
     runtime: Runtime,
     cpu: bool,
+    // Last /colorize activity — drives the idle unload of the DirectML sessions
+    // (their allocator arena retains multi-GB of VRAM until the session drops).
+    colorize_last: Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -452,12 +455,17 @@ async fn async_main() -> anyhow::Result<()> {
 
     let state = AppState {
         engines: Arc::new(Mutex::new(Engines { layout, segmenter, bubble, anime, ocr, inpainter, colorizer: None, denoiser: None })),
+        colorize_last: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         config: Arc::new(RwLock::new(cfg)),
         root: Arc::new(root),
         device,
         runtime,
         cpu,
     };
+
+    // Cloned for the colorize idle-unload task (state moves into the router).
+    let engines_for_unload = state.engines.clone();
+    let colorize_last_for_unload = state.colorize_last.clone();
 
     let app = Router::new()
         .route("/", get(settings_page))
@@ -489,6 +497,31 @@ async fn async_main() -> anyhow::Result<()> {
             tracing::warn!("could not open browser: {e}");
         }
     }
+    // Idle unload of the colorize DirectML sessions. Their ONNX Runtime
+    // allocator arena retains VRAM at the activation high-water mark (~5 GB
+    // after one Ultra page) until the Session drops, so release them after a
+    // quiet period — the next /colorize just reloads (~1-2 s).
+    {
+        const COLORIZE_IDLE_SECS: u64 = 90;
+        let engines = engines_for_unload;
+        let last = colorize_last_for_unload;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let idle = last.lock().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                if idle < COLORIZE_IDLE_SECS {
+                    continue;
+                }
+                let mut e = engines.lock().await;
+                if e.colorizer.is_some() || e.denoiser.is_some() {
+                    e.colorizer = None;
+                    e.denoiser = None;
+                    tracing::info!("colorizer idle {idle}s — sessions unloaded, VRAM released");
+                }
+            }
+        });
+    }
+
     // Background update check (non-blocking) — just logs; the user applies it
     // from the settings page. Network failures are ignored.
     tokio::spawn(async {
@@ -669,6 +702,7 @@ async fn ocr_page(
         None
     };
 
+    trim_cuda_pool();
     Ok(Json(OcrResponse { boxes, cleaned_image }))
 }
 
@@ -684,6 +718,27 @@ fn to_data_url_png(img: &DynamicImage) -> anyhow::Result<String> {
     img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
     Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&buf)))
 }
+
+/// Release unused CUDA memory-pool blocks back to the OS. candle allocates via
+/// cuMemAllocAsync, whose stream-ordered pool retains freed blocks at the
+/// high-water mark — one heavy inpaint left ~13 GB of VRAM reserved on an idle
+/// helper. Trimming after each heavy request drops idle VRAM back to the true
+/// working set (model weights are live allocations and are unaffected). All
+/// failures are ignored: CPU mode, non-NVIDIA, or older drivers simply no-op.
+#[cfg(feature = "cuda")]
+fn trim_cuda_pool() {
+    use cudarc::driver::result as cu;
+    unsafe {
+        if cu::init().is_err() {
+            return;
+        }
+        let Ok(dev) = cu::device::get(0) else { return };
+        let Ok(pool) = cu::device::get_mem_pool(dev) else { return };
+        let _ = cu::mem_pool::trim_to(pool, 0);
+    }
+}
+#[cfg(not(feature = "cuda"))]
+fn trim_cuda_pool() {}
 
 // ---------------------------------------------------------------------------
 // Shared pipeline pieces (used by both one-shot /ocr-page and staged endpoints)
@@ -1134,6 +1189,7 @@ async fn detect_handler(
     let mask = DynamicImage::ImageLuma8(
         segment_mask_view(&engines, &img).map_err(AppError::internal)?,
     );
+    trim_cuda_pool();
     Ok(Json(DetectResponse {
         boxes,
         mask: to_data_url_png(&mask).map_err(AppError::internal)?,
@@ -1176,6 +1232,7 @@ async fn ocr_handler(
             confidence: 1.0,
         });
     }
+    trim_cuda_pool();
     Ok(Json(OcrResponse { boxes: out, cleaned_image: None }))
 }
 
@@ -1193,7 +1250,9 @@ async fn inpaint_handler(
     ensure_detector(&mut engines, &s.runtime, s.cpu, &detector)
         .await
         .map_err(AppError::internal)?;
-    match run_inpaint(&engines, &img, threshold, &detector).map_err(AppError::internal)? {
+    let result = run_inpaint(&engines, &img, threshold, &detector).map_err(AppError::internal)?;
+    trim_cuda_pool();
+    match result {
         Some(clean) => Ok(Json(InpaintResponse {
             cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
         })),
@@ -1231,7 +1290,9 @@ async fn inpaint_region_handler(
         (c.det_threshold, c.detector.clone())
     };
     let engines = s.engines.lock().await;
-    match inpaint_region(&engines, &img, threshold, &detector, &px).map_err(AppError::internal)? {
+    let result = inpaint_region(&engines, &img, threshold, &detector, &px).map_err(AppError::internal)?;
+    trim_cuda_pool();
+    match result {
         Some(clean) => Ok(Json(InpaintResponse {
             cleaned_image: to_data_url_png(&clean).map_err(AppError::internal)?,
         })),
@@ -1361,6 +1422,10 @@ async fn colorize_handler(
         let colored = colorize::colorize_tile(colorizer, denoiser.as_deref_mut(), &tile, short)
             .map_err(AppError::internal)?;
         image::imageops::overlay(&mut out, &colored, 0, y0 as i64);
+    }
+    // Mark activity for the idle unloader (keeps the sessions warm mid-batch).
+    if let Ok(mut t) = s.colorize_last.lock() {
+        *t = std::time::Instant::now();
     }
     Ok(Json(ColorizeResponse {
         colorized_image: to_data_url_png(&DynamicImage::ImageRgb8(out)).map_err(AppError::internal)?,

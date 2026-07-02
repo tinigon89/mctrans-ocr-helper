@@ -1,6 +1,6 @@
 [package]
 name = "mctrans-ocr-helper"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 # GPL-3.0 because it links koharu-ml (GPL-3.0). Keep this crate in its OWN repo
 # (a fork of / sibling to koharu), NOT inside the proprietary MC-Trans repo.
@@ -40,13 +40,19 @@ open = "5"
 # Self-update from GitHub Releases (download + replace the running exe).
 self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-zip", "compression-zip-deflate"] }
 
+# Direct cudarc handle so we can cuMemPoolTrimTo after heavy candle ops (the
+# stream-ordered pool retains freed VRAM at the high-water mark otherwise).
+# default-features = false is REQUIRED: the default enables dynamic-linking,
+# which conflicts with the dynamic-loading the koharu candle fork uses.
+cudarc = { version = "0.19", default-features = false, features = ["driver", "std"], optional = true }
+
 # GPU: enable the matching feature from koharu-ml (e.g. "cuda" / "metal").
 # Default build = CPU. For NVIDIA:
 #   cargo build --release --features cuda
 # (requires CUDA toolkit + the candle cuda feature wired through koharu-ml)
 [features]
 default = []
-cuda = ["koharu-ml/cuda"]
+cuda = ["koharu-ml/cuda", "dep:cudarc"]
 metal = ["koharu-ml/metal"]
 
 # Required for `--features cuda`: koharu builds against forked candle + ug that
