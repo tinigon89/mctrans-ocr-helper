@@ -9,4 +9,11 @@ CARGO_WORKSPACE_DIR = { value = "", relative = true }
 LLAMA_CPP_TAG = "b8935"
 # Only relevant for `--features cuda` builds:
 NVCC_PREPEND_FLAGS = "-std=c++17"
-CUDA_COMPUTE_CAP = "89"   # RTX 4090 / Ada Lovelace (compute 8.9)
+# Turing (compute 7.5) — the LOWEST card we support (RTX 20xx, e.g. 2060) and
+# CUDA 13.0's real floor. candle emits PTX for this arch; the driver JIT-compiles
+# it up to the running GPU, so ONE binary runs on Turing through Blackwell (2060
+# → 4090 → 50xx). Do NOT raise this to the build box's own cap (was 89 / Ada) or
+# the release stops running on every card below it. (candle-flash-attn ignores
+# this and always builds sm_80, but the helper never launches flux2, so those
+# kernels just sit unused — see the koharu fork note in Cargo.toml.)
+CUDA_COMPUTE_CAP = "75"

@@ -69,9 +69,20 @@ set "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
 cargo build --release --features cuda
 ```
 
-Set `CUDA_COMPUTE_CAP` in `.cargo/config.toml` to your GPU (89 = RTX 4090 / Ada).
-If you switch CUDA toolkit versions, `cargo clean -p cudarc -p candle-kernels`
-first so they recompile against the new one.
+`CUDA_COMPUTE_CAP` in `.cargo/config.toml` is **75** (Turing / RTX 20xx) on
+purpose — candle emits PTX for that arch and the driver JIT-compiles it up to
+the running GPU, so one release runs on Turing → Ada → Blackwell (2060 → 4090 →
+50xx). Do **not** raise it to the build box's own cap: a binary built for 89
+(Ada) refuses to launch its kernels on any card below Ada and silently drops to
+CPU. If you switch CUDA toolkit versions, `cargo clean -p cudarc -p
+candle-kernels` first so they recompile against the new one.
+
+> GPU floor is **Turing (compute 7.5)**, CUDA 13.0's real minimum. We consume a
+> [fork of koharu](https://github.com/tinigon89/koharu/tree/turing-cc75) whose
+> only change lowers koharu's Ampere-8.0 gate to 7.5 — upstream's floor forced
+> Turing cards to run candle inpaint/detection on CPU while llama.cpp OCR kept
+> the GPU. The helper's candle models are fp32 conv nets (no flash-attn/bf16),
+> so Turing is safe.
 
 The built binary is **self-contained**: it runs with nothing CUDA on PATH (the
 toolkit is only needed to *build*). Just run the exe — or `run.bat`.

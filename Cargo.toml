@@ -1,6 +1,6 @@
 [package]
 name = "mctrans-ocr-helper"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 # GPL-3.0 because it links koharu-ml (GPL-3.0). Keep this crate in its OWN repo
 # (a fork of / sibling to koharu), NOT inside the proprietary MC-Trans repo.
@@ -9,9 +9,15 @@ license = "GPL-3.0-only"
 [dependencies]
 # koharu ML library (Candle-based): detectors + PaddleOCR-VL + inpainting.
 # Depend on the individual workspace member crates by git.
-koharu-ml = { git = "https://github.com/mayocream/koharu", package = "koharu-ml", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
-koharu-llm = { git = "https://github.com/mayocream/koharu", package = "koharu-llm", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
-koharu-runtime = { git = "https://github.com/mayocream/koharu", package = "koharu-runtime", rev = "a8d3bdc905a3f2132fac35ea48667ab67c91d669" }
+# Fork of mayocream/koharu @ a8d3bdc + a one-line patch lowering the candle GPU
+# floor from Ampere 8.0 to Turing 7.5 (branch turing-cc75). Upstream gated CUDA
+# on compute >= 8.0, forcing Turing cards (RTX 20xx, e.g. 2060) to run candle
+# inpaint/detection on CPU while llama.cpp OCR still used the GPU. CUDA 13.0's
+# real floor is 7.5 and the helper's candle models are fp32 conv nets (no
+# flash-attn/bf16), so Turing is safe. See tinigon89/koharu@turing-cc75.
+koharu-ml = { git = "https://github.com/tinigon89/koharu", package = "koharu-ml", rev = "61f6fc5fd26d269b225fd0f639ebee5c08210d40" }
+koharu-llm = { git = "https://github.com/tinigon89/koharu", package = "koharu-llm", rev = "61f6fc5fd26d269b225fd0f639ebee5c08210d40" }
+koharu-runtime = { git = "https://github.com/tinigon89/koharu", package = "koharu-runtime", rev = "61f6fc5fd26d269b225fd0f639ebee5c08210d40" }
 
 # ONNX Runtime for the manga colorizer (Mode A). The "cuda" feature registers
 # the CUDA execution provider; colorize.rs falls back to CPU when it can't load.

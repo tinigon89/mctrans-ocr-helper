@@ -359,7 +359,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2446,15 +2446,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -2555,7 +2546,7 @@ dependencies = [
 [[package]]
 name = "koharu-core"
 version = "0.61.2"
-source = "git+https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc905a3f2132fac35ea48667ab67c91d669"
+source = "git+https://github.com/tinigon89/koharu?rev=61f6fc5fd26d269b225fd0f639ebee5c08210d40#61f6fc5fd26d269b225fd0f639ebee5c08210d40"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2571,7 +2562,7 @@ dependencies = [
 [[package]]
 name = "koharu-llm"
 version = "0.61.2"
-source = "git+https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc905a3f2132fac35ea48667ab67c91d669"
+source = "git+https://github.com/tinigon89/koharu?rev=61f6fc5fd26d269b225fd0f639ebee5c08210d40#61f6fc5fd26d269b225fd0f639ebee5c08210d40"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -2606,7 +2597,7 @@ dependencies = [
 [[package]]
 name = "koharu-ml"
 version = "0.61.2"
-source = "git+https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc905a3f2132fac35ea48667ab67c91d669"
+source = "git+https://github.com/tinigon89/koharu?rev=61f6fc5fd26d269b225fd0f639ebee5c08210d40#61f6fc5fd26d269b225fd0f639ebee5c08210d40"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2636,7 +2627,7 @@ dependencies = [
 [[package]]
 name = "koharu-runtime"
 version = "0.61.2"
-source = "git+https://github.com/mayocream/koharu?rev=a8d3bdc905a3f2132fac35ea48667ab67c91d669#a8d3bdc905a3f2132fac35ea48667ab67c91d669"
+source = "git+https://github.com/tinigon89/koharu?rev=61f6fc5fd26d269b225fd0f639ebee5c08210d40#61f6fc5fd26d269b225fd0f639ebee5c08210d40"
 dependencies = [
  "anyhow",
  "atomicwrites",
@@ -2855,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "mctrans-ocr-helper"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "axum",
@@ -5911,7 +5902,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
