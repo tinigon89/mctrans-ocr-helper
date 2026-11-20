@@ -94,6 +94,9 @@ impl Default for Config {
             ocr: "paddleocr-vl".into(),
             inpainter: "lama".into(),
             compute: "gpu".into(),
+            // PP-DocLayout stays the default by choice. On real manhwa pages (2026-11-20)
+            // it missed whole caption boxes that "comic-text-bubble" found — switch the
+            // Detector in settings when a page comes back with bubbles missing.
             detector: "pp-doclayout".into(),
             det_threshold: 0.3,
             direction: "auto".into(),
@@ -205,6 +208,8 @@ fn cleanup_update_temp() {
 }
 
 /// Relaunch the (now-replaced) exe in a fresh console, then exit this process.
+const RELAUNCHED_ENV: &str = "MCTRANS_HELPER_RELAUNCHED";
+
 fn relaunch_and_exit() -> ! {
     if let Ok(exe) = std::env::current_exe() {
         let mut cmd = std::process::Command::new(&exe);
@@ -214,6 +219,9 @@ fn relaunch_and_exit() -> ! {
             const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
             cmd.creation_flags(CREATE_NEW_CONSOLE);
         }
+        // Tells the new process it replaces a running one: wait for the port instead of
+        // giving up at once, and do not open another browser tab.
+        cmd.env(RELAUNCHED_ENV, "1");
         let _ = cmd.spawn();
     }
     std::process::exit(0);
@@ -378,12 +386,29 @@ async fn async_main() -> anyhow::Result<()> {
     // Claim the port BEFORE loading any model. A duplicate instance used to
     // load ~3 GB of models into VRAM first and only then die on the bind —
     // now it exits immediately with a clear message and zero GPU cost.
-    let listener = tokio::net::TcpListener::bind(BIND).await.with_context(|| {
-        format!(
-            "cannot listen on {BIND} — another MC-Trans OCR helper instance is \
-             probably already running (check the tray / task manager)"
-        )
-    })?;
+    // MCTRANS_HELPER_BIND lets a second instance run next to the normal one (testing a new
+    // build without stopping the helper the web app is talking to).
+    let bind = std::env::var("MCTRANS_HELPER_BIND").unwrap_or_else(|_| BIND.to_string());
+    // After a restart / self-update the old process may still hold the port for a moment.
+    let relaunched = std::env::var_os(RELAUNCHED_ENV).is_some();
+    let mut attempts = if relaunched { 40 } else { 1 };
+    let listener = loop {
+        match tokio::net::TcpListener::bind(&bind).await {
+            Ok(l) => break l,
+            Err(_) if attempts > 1 => {
+                attempts -= 1;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "cannot listen on {bind} — another MC-Trans OCR helper instance is \
+                         probably already running (check the tray / task manager)"
+                    )
+                })
+            }
+        }
+    };
 
     let runtime = Runtime::new(
         root.clone(),
@@ -481,6 +506,7 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/data-dir", get(get_data_dir).post(set_data_dir))
         .route("/update-check", get(update_check))
         .route("/update", post(update_apply))
+        .route("/restart", post(restart_handler))
         // axum defaults to a 2 MB body limit — raise it so large pages (webp /
         // hi-res scans routinely exceed 2 MB) don't fail multipart parsing.
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
@@ -489,9 +515,9 @@ async fn async_main() -> anyhow::Result<()> {
         .with_state(state);
 
     // (port already claimed up top, before the models loaded)
-    tracing::info!("MC-Trans OCR helper on http://{BIND}  (settings: open it in a browser)");
+    tracing::info!("MC-Trans OCR helper on http://{bind}  (settings: open it in a browser)");
     // Open the web app in the default browser now that the server is listening.
-    if open_browser && !open_url.trim().is_empty() {
+    if open_browser && !relaunched && !open_url.trim().is_empty() {
         tracing::info!("opening {open_url} in the default browser");
         if let Err(e) = open::that(open_url.trim()) {
             tracing::warn!("could not open browser: {e}");
@@ -616,6 +642,19 @@ async fn update_check() -> Result<Json<serde_json::Value>, AppError> {
     Ok(Json(serde_json::json!({ "current": current, "latest": latest, "available": available })))
 }
 
+/// POST /restart — relaunch the helper so OCR / Inpainter / Compute / data-folder
+/// changes take effect. Waits for a request that is using the models to finish.
+async fn restart_handler(State(s): State<AppState>) -> Json<serde_json::Value> {
+    tokio::spawn(async move {
+        // Let this response flush first.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _busy = s.engines.lock().await;
+        tracing::info!("restart requested from the settings page — restarting");
+        relaunch_and_exit();
+    });
+    Json(serde_json::json!({ "ok": true, "restarting": true }))
+}
+
 async fn update_apply() -> Result<Json<serde_json::Value>, AppError> {
     let version = tokio::task::spawn_blocking(run_self_update)
         .await
@@ -643,10 +682,15 @@ async fn ocr_page(
     let mut img_bytes: Option<Vec<u8>> = None;
     let mut inpaint_override: Option<bool> = None;
     let mut direction_override: Option<String> = None;
+    let mut skip_sfx = false;
 
     while let Some(field) = form.next_field().await.map_err(AppError::bad)? {
         match field.name() {
             Some("file") => img_bytes = Some(field.bytes().await.map_err(AppError::bad)?.to_vec()),
+            Some("skipSfx") => {
+                let v = field.text().await.map_err(AppError::bad)?;
+                skip_sfx = v == "true" || v == "1";
+            }
             Some("inpaint") => {
                 let v = field.text().await.map_err(AppError::bad)?;
                 inpaint_override = Some(v == "true" || v == "1");
@@ -672,7 +716,7 @@ async fn ocr_page(
         .map_err(AppError::internal)?;
 
     // 1. Detect text blocks, then OCR each crop.
-    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector)
+    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector, skip_sfx)
         .map_err(AppError::internal)?;
     let mut boxes = Vec::new();
     for (bbox, score) in regions {
@@ -818,6 +862,60 @@ fn smart_tiles(img: &DynamicImage) -> Vec<(u32, u32)> {
     tiles
 }
 
+/// PP-DocLayout labels that carry text to OCR ("text", "vertical_text",
+/// "aside_text", "doc_title", "paragraph_title", "figure_title", "content").
+/// Same rule as koharu's own pp_doclayout engine; everything else (image, chart,
+/// table, seal, header_image…) is artwork or page furniture.
+fn is_text_label(label: &str) -> bool {
+    let l = label.to_ascii_lowercase();
+    l == "content" || l.contains("text") || l.contains("title")
+}
+
+/// Whether a PP-DocLayout region goes to OCR: every text-labelled one, and any other
+/// only when it does not already hold a text region (then it is that text's bubble).
+fn keep_layout_region(label: &str, bbox: [f32; 4], text: &[[f32; 4]]) -> bool {
+    is_text_label(label)
+        || !text.iter().any(|t| bbox_overlap(*t, bbox) / bbox_area(*t) >= 0.5)
+}
+
+/// A region that overlaps an already-kept one by this share of EITHER area is the
+/// same block reported twice (or a fragment nested in it). Mirrors koharu.
+const REGION_OVERLAP_DUP: f32 = 0.9;
+
+fn bbox_area(b: [f32; 4]) -> f32 {
+    ((b[2] - b[0]) * (b[3] - b[1])).max(1.0)
+}
+
+fn bbox_overlap(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let w = a[2].min(b[2]) - a[0].max(b[0]);
+    let h = a[3].min(b[3]) - a[1].max(b[1]);
+    if w > 0.0 && h > 0.0 { w * h } else { 0.0 }
+}
+
+/// True when a text block is free text on the artwork (a sound effect, a sign):
+/// it overlaps a label-2 detection more than any label-1 one.
+fn is_free_text(bbox: [f32; 4], in_bubble: &[[f32; 4]], free: &[[f32; 4]]) -> bool {
+    let best = |boxes: &[[f32; 4]]| boxes.iter().map(|b| bbox_overlap(bbox, *b)).fold(0.0f32, f32::max);
+    let (bubble, free) = (best(in_bubble), best(free));
+    free > bubble && free / bbox_area(bbox) >= 0.5
+}
+
+/// Drop duplicate / nested regions, keeping the first in the given order.
+fn dedupe_overlapping(regions: Vec<([f32; 4], f32)>) -> Vec<([f32; 4], f32)> {
+    let mut out: Vec<([f32; 4], f32)> = Vec::with_capacity(regions.len());
+    for (bbox, score) in regions {
+        let area = bbox_area(bbox);
+        let dup = out.iter().any(|(kept, _)| {
+            let ov = bbox_overlap(bbox, *kept);
+            ov / area >= REGION_OVERLAP_DUP || ov / bbox_area(*kept) >= REGION_OVERLAP_DUP
+        });
+        if !dup {
+            out.push((bbox, score));
+        }
+    }
+    out
+}
+
 /// Raw detection on ONE image (no tiling) — boxes in that image's pixel coords,
 /// filtered, plus whether PP-DocLayout's model reading order was applied.
 fn detect_tile(
@@ -825,6 +923,7 @@ fn detect_tile(
     img: &DynamicImage,
     threshold: f32,
     detector: &str,
+    skip_free: bool,
 ) -> anyhow::Result<(Vec<([f32; 4], f32)>, bool)> {
     let (iw, ih) = (img.width() as f32, img.height() as f32);
     let mut pp_auto = false;
@@ -836,15 +935,25 @@ fn detect_tile(
             .into_iter()
             .map(|r| ([r.x, r.y, r.x + r.width, r.y + r.height], r.confidence))
             .collect(),
-        "comic-text-bubble" => engines
-            .bubble
-            .as_ref()
-            .context("Comic Text & Bubble detector not loaded")?
-            .inference_with_threshold(img, threshold)?
-            .text_blocks
-            .into_iter()
-            .map(|r| ([r.x, r.y, r.x + r.width, r.y + r.height], r.confidence))
-            .collect(),
+        "comic-text-bubble" => {
+            let det = engines
+                .bubble
+                .as_ref()
+                .context("Comic Text & Bubble detector not loaded")?
+                .inference_with_threshold(img, threshold)?;
+            // The model labels each text region: 1 = text inside a bubble / caption
+            // box, 2 = free text on the artwork (sound effects, signs). text_blocks
+            // drops the label, so match each block back to its detection.
+            let of_label = |id: usize| -> Vec<[f32; 4]> {
+                det.detections.iter().filter(|d| d.label_id == id).map(|d| d.bbox).collect()
+            };
+            let (in_bubble, free) = (of_label(1), of_label(2));
+            det.text_blocks
+                .into_iter()
+                .map(|r| ([r.x, r.y, r.x + r.width, r.y + r.height], r.confidence))
+                .filter(|(bbox, _)| !(skip_free && is_free_text(*bbox, &in_bubble, &free)))
+                .collect()
+        }
         "anime-text" => engines
             .anime
             .as_ref()
@@ -858,7 +967,34 @@ fn detect_tile(
             let mut regions = engines.layout.inference_one(img, threshold)?.regions;
             regions.sort_by_key(|r| r.order);
             pp_auto = true;
-            regions.into_iter().map(|r| (r.bbox, r.score)).collect()
+            // PP-DocLayout is a DOCUMENT layout model. On comic pages it labels a region
+            // "text" when it sees the lettering, but a whole bubble or caption box often
+            // comes back as "image" — sometimes around a "text" region it also found
+            // (the same bubble twice), sometimes as the ONLY region for that caption.
+            // So: text regions always go to OCR; any other region only when no text
+            // region sits inside it. Art panels with no lettering still reach OCR and
+            // come back empty, as before.
+            let text: Vec<[f32; 4]> = regions
+                .iter()
+                .filter(|r| is_text_label(&r.label))
+                .map(|r| r.bbox)
+                .collect();
+            let keep = |r: &koharu_ml::pp_doclayout_v3::LayoutRegion| keep_layout_region(&r.label, r.bbox, &text);
+            tracing::info!(
+                "pp-doclayout regions: {}",
+                regions
+                    .iter()
+                    .map(|r| format!("{}({:.2}{})", r.label, r.score, if keep(r) { "" } else { " dropped" }))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            dedupe_overlapping(
+                regions
+                    .iter()
+                    .filter(|r| keep(r))
+                    .map(|r| (r.bbox, r.score))
+                    .collect(),
+            )
         }
     };
     // Drop degenerate / panel-sized regions (likely figures, not text).
@@ -900,6 +1036,7 @@ fn detect_regions(
     threshold: f32,
     direction: &str,
     detector: &str,
+    skip_free: bool,
 ) -> anyhow::Result<Vec<([f32; 4], f32)>> {
     let w = img.width();
     let tiles = smart_tiles(img);
@@ -914,7 +1051,7 @@ fn detect_regions(
         } else {
             img
         };
-        let (mut raw, pa) = detect_tile(engines, tile, threshold, detector)?;
+        let (mut raw, pa) = detect_tile(engines, tile, threshold, detector, skip_free)?;
         pp_auto = pa;
         for (bbox, _) in raw.iter_mut() {
             bbox[1] += y0 as f32; // offset into full-image coords
@@ -970,7 +1107,7 @@ fn inpaint_masks(
     // double as LaMa's bubble_mask. Explicit boxes override auto-detection.
     let regions: Vec<[f32; 4]> = match explicit {
         Some(b) => b.to_vec(),
-        None => detect_regions(engines, img, threshold, "auto", detector)?
+        None => detect_regions(engines, img, threshold, "auto", detector, false)?
             .into_iter()
             .map(|(bb, _)| bb)
             .collect(),
@@ -1151,9 +1288,14 @@ async fn detect_handler(
 ) -> Result<Json<DetectResponse>, AppError> {
     let mut img_bytes: Option<Vec<u8>> = None;
     let mut direction_override: Option<String> = None;
+    let mut skip_sfx = false;
     while let Some(field) = form.next_field().await.map_err(AppError::bad)? {
         match field.name() {
             Some("file") => img_bytes = Some(field.bytes().await.map_err(AppError::bad)?.to_vec()),
+            Some("skipSfx") => {
+                let v = field.text().await.map_err(AppError::bad)?;
+                skip_sfx = v == "true" || v == "1";
+            }
             Some("direction") => {
                 direction_override = Some(field.text().await.map_err(AppError::bad)?)
             }
@@ -1170,7 +1312,7 @@ async fn detect_handler(
         .await
         .map_err(AppError::internal)?;
 
-    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector)
+    let regions = detect_regions(&engines, &img, cfg.det_threshold, direction, &cfg.detector, skip_sfx)
         .map_err(AppError::internal)?;
     let boxes = regions
         .into_iter()
@@ -1457,3 +1599,48 @@ impl IntoResponse for AppError {
 }
 
 const SETTINGS_HTML: &str = include_str!("settings.html");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_labels_only() {
+        for l in ["text", "vertical_text", "aside_text", "doc_title", "paragraph_title", "figure_title", "content", "Text"] {
+            assert!(is_text_label(l), "{l} should be OCR-ed");
+        }
+        for l in ["image", "chart", "table", "seal", "header_image", "footer_image", "formula_number", "number"] {
+            assert!(!is_text_label(l), "{l} should be skipped");
+        }
+    }
+
+    #[test]
+    fn a_bubble_region_around_its_text_is_dropped_but_a_lone_caption_stays() {
+        let text = [[750.0, 2995.0, 1095.0, 3147.0]];
+        // "image" region that is the whole bubble around that text
+        assert!(!keep_layout_region("image", [695.0, 2768.0, 1151.0, 3251.0], &text));
+        // "image" region that is a caption box with no text region of its own
+        assert!(keep_layout_region("image", [373.0, 614.0, 1023.0, 1003.0], &text));
+        assert!(keep_layout_region("text", [695.0, 2768.0, 1151.0, 3251.0], &text));
+        assert!(keep_layout_region("image", [0.0, 0.0, 100.0, 100.0], &[]));
+    }
+
+    #[test]
+    fn nested_and_repeated_regions_collapse_to_the_first() {
+        let block = ([100.0, 100.0, 400.0, 300.0], 0.9);
+        let same_again = ([102.0, 101.0, 398.0, 299.0], 0.8);
+        let line_inside = ([110.0, 110.0, 390.0, 150.0], 0.7);
+        let elsewhere = ([100.0, 600.0, 400.0, 700.0], 0.9);
+        let out = dedupe_overlapping(vec![block, same_again, line_inside, elsewhere]);
+        assert_eq!(out, vec![block, elsewhere]);
+    }
+
+    #[test]
+    fn neighbours_that_only_touch_or_partly_overlap_are_kept() {
+        let a = ([0.0, 0.0, 100.0, 100.0], 0.9);
+        let touching = ([100.0, 0.0, 200.0, 100.0], 0.9);
+        let partly = ([50.0, 80.0, 150.0, 180.0], 0.9);
+        let out = dedupe_overlapping(vec![a, touching, partly]);
+        assert_eq!(out.len(), 3);
+    }
+}

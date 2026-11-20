@@ -111,12 +111,16 @@
 
   <div class="actions">
     <button id="save">Save</button>
+    <button id="restart">Restart helper</button>
     <span id="saved" class="saved">Saved ✓</span>
   </div>
+  <p class="hint" id="restartMsg" style="margin-top:8px"></p>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
+
+let running = null;
 
 async function load() {
   try {
@@ -135,6 +139,9 @@ async function load() {
   $('detThresholdVal').textContent = Number(c.detThreshold).toFixed(2);
   $('direction').value = c.direction;
   $('defaultInpaint').checked = c.defaultInpaint;
+  // What the RUNNING helper was started with, as far as this page knows: the values on
+  // load. Saving a different engine then needs a restart.
+  running = { ocr: c.ocr, inpainter: c.inpainter, compute: c.compute };
   await loadDataDir();
 }
 
@@ -160,6 +167,7 @@ $('saveDataDir').addEventListener('click', async () => {
       body: JSON.stringify({ path: $('dataDir').value.trim() }),
     });
     const j = await res.json().catch(() => ({}));
+    if (res.ok) needRestart();
     $('dataDirHint').textContent = res.ok
       ? 'Saved — restart the helper to move the cache. (Existing files are not moved automatically.)'
       : ('Failed: ' + (j.error || res.status));
@@ -190,6 +198,45 @@ $('save').addEventListener('click', async () => {
   $('save').disabled = false;
   const s = $('saved'); s.classList.add('show');
   setTimeout(() => s.classList.remove('show'), 1600);
+  if (running && (body.ocr !== running.ocr || body.inpainter !== running.inpainter || body.compute !== running.compute)) {
+    needRestart();
+  }
+});
+
+function needRestart() {
+  $('restartMsg').textContent = 'Saved. This change takes effect after a restart — press "Restart helper".';
+  $('restartMsg').className = 'restart';
+}
+
+$('restart').addEventListener('click', async () => {
+  const btn = $('restart'), msg = $('restartMsg');
+  btn.disabled = true; $('save').disabled = true;
+  msg.className = 'hint';
+  msg.textContent = 'Restarting… (waits for a running OCR to finish, then reloads the models)';
+  try {
+    const res = await fetch('/restart', { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+  } catch (e) {
+    msg.textContent = 'Could not restart: ' + e + '. Close the helper window and start it again.';
+    btn.disabled = false; $('save').disabled = false;
+    return;
+  }
+  // The new process answers /health once its models are loaded; that can take a while.
+  const started = Date.now();
+  let wentDown = false;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let up = false;
+    try { up = (await fetch('/health', { signal: AbortSignal.timeout(2500) })).ok; } catch {}
+    if (!up) wentDown = true;
+    if (up && (wentDown || Date.now() - started > 8000)) { location.reload(); return; }
+    if (Date.now() - started > 300000) {
+      msg.textContent = 'The helper has not come back after 5 minutes. Check its window for an error.';
+      btn.disabled = false; $('save').disabled = false;
+      return;
+    }
+    msg.textContent = 'Restarting… ' + Math.round((Date.now() - started) / 1000) + 's';
+  }
 });
 
 async function checkUpdate() {
