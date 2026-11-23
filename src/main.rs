@@ -208,6 +208,38 @@ fn cleanup_update_temp() {
 }
 
 /// Relaunch the (now-replaced) exe in a fresh console, then exit this process.
+/// Lowest NVIDIA compute capability the candle models run on.
+///
+/// The release embeds candle's GPU kernels as PTX for sm_80 (Ampere). Building for
+/// sm_75 (Turing) does not help: candle compiles its bf16 kernels only for 8.0 and up,
+/// and these models call them, so an sm_75 build fails on EVERY card with
+/// "CUDA_ERROR_NOT_FOUND, named symbol not found". Below 8.0 (RTX 20xx, GTX 16xx/10xx)
+/// the candle models therefore run on the CPU, while PaddleOCR-VL keeps the GPU through
+/// llama.cpp, which ships its own kernels for those cards. Before this, 0.1.14 and 0.1.15
+/// sent Turing cards to the GPU with sm_89 kernels: "CUDA_ERROR_INVALID_PTX, a PTX JIT
+/// compilation failed" on loading PP-DocLayout.
+const CANDLE_MIN_COMPUTE: (i32, i32) = (8, 0);
+
+/// Whether the candle models must run on the CPU although the GPU is enabled.
+/// MCTRANS_HELPER_CANDLE_CPU=1 forces it (support / testing the Turing path).
+fn candle_needs_cpu() -> bool {
+    if std::env::var_os("MCTRANS_HELPER_CANDLE_CPU").is_some() {
+        tracing::warn!("MCTRANS_HELPER_CANDLE_CPU set: detection and inpaint run on the CPU");
+        return true;
+    }
+    match koharu_runtime::compute_capability() {
+        Ok(cap) if cap < CANDLE_MIN_COMPUTE => {
+            tracing::warn!(
+                "GPU compute capability {}.{} is below {}.{}: detection and inpaint run on the CPU, OCR stays on the GPU",
+                cap.0, cap.1, CANDLE_MIN_COMPUTE.0, CANDLE_MIN_COMPUTE.1
+            );
+            true
+        }
+        // Not NVIDIA, or no driver: candle picks Metal / CPU by itself, as before.
+        _ => false,
+    }
+}
+
 const RELAUNCHED_ENV: &str = "MCTRANS_HELPER_RELAUNCHED";
 
 fn relaunch_and_exit() -> ! {
@@ -382,6 +414,9 @@ async fn async_main() -> anyhow::Result<()> {
     let cfg = load_config(&root);
     let cpu = cfg.compute == "cpu";
     let device = if cpu { "cpu" } else { "gpu" };
+    // Candle models (detection, segmentation, inpaint, Manga OCR / MIT 48px) may need the CPU
+    // even when the GPU is used: see candle_needs_cpu. llama.cpp OCR keeps `cpu`.
+    let candle_cpu = cpu || candle_needs_cpu();
 
     // Claim the port BEFORE loading any model. A duplicate instance used to
     // load ~3 GB of models into VRAM first and only then die on the bind —
@@ -426,13 +461,13 @@ async fn async_main() -> anyhow::Result<()> {
     runtime.prepare().await.context("prepare runtime")?;
 
     tracing::info!("loading models (ocr={}, inpainter={})…", cfg.ocr, cfg.inpainter);
-    let layout = PPDocLayoutV3::load(&runtime, cpu).await.context("load PP-DocLayout V3")?;
-    let segmenter = ComicTextDetector::load(&runtime, cpu).await.context("load segmenter")?;
+    let layout = PPDocLayoutV3::load(&runtime, candle_cpu).await.context("load PP-DocLayout V3")?;
+    let segmenter = ComicTextDetector::load(&runtime, candle_cpu).await.context("load segmenter")?;
 
     // Optional detectors — loaded only when selected (each downloads its model).
     let bubble = if cfg.detector == "comic-text-bubble" {
         Some(
-            ComicTextBubbleDetector::load(&runtime, cpu)
+            ComicTextBubbleDetector::load(&runtime, candle_cpu)
                 .await
                 .context("load Comic Text & Bubble detector")?,
         )
@@ -441,7 +476,7 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let anime = if cfg.detector == "anime-text" {
         Some(
-            AnimeTextDetector::load(&runtime, cpu)
+            AnimeTextDetector::load(&runtime, candle_cpu)
                 .await
                 .context("load Anime Text YOLO")?,
         )
@@ -452,13 +487,13 @@ async fn async_main() -> anyhow::Result<()> {
 
     let inpainter = match cfg.inpainter.as_str() {
         "off" => Inpainter::Off,
-        "aot" => Inpainter::Aot(AotInpainting::load(&runtime, cpu).await.context("load AOT")?),
-        _ => Inpainter::Lama(Lama::load(&runtime, cpu).await.context("load LaMa")?),
+        "aot" => Inpainter::Aot(AotInpainting::load(&runtime, candle_cpu).await.context("load AOT")?),
+        _ => Inpainter::Lama(Lama::load(&runtime, candle_cpu).await.context("load LaMa")?),
     };
 
     let ocr = match cfg.ocr.as_str() {
-        "manga-ocr" => Ocr::Manga(MangaOcr::load(&runtime, cpu).await.context("load Manga OCR")?),
-        "mit48px" => Ocr::Mit48px(Mit48pxOcr::load(&runtime, cpu).await.context("load MIT 48px")?),
+        "manga-ocr" => Ocr::Manga(MangaOcr::load(&runtime, candle_cpu).await.context("load Manga OCR")?),
+        "mit48px" => Ocr::Mit48px(Mit48pxOcr::load(&runtime, candle_cpu).await.context("load MIT 48px")?),
         _ => {
             // PaddleOCR-VL 1.6 GGUF via llama.cpp (runtime already prepared above).
             koharu_llm::sys::initialize(&runtime).context("init llama.cpp bindings")?;
@@ -485,7 +520,7 @@ async fn async_main() -> anyhow::Result<()> {
         root: Arc::new(root),
         device,
         runtime,
-        cpu,
+        cpu: candle_cpu,
     };
 
     // Cloned for the colorize idle-unload task (state moves into the router).

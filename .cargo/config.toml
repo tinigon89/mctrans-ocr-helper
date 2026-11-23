@@ -9,11 +9,16 @@ CARGO_WORKSPACE_DIR = { value = "", relative = true }
 LLAMA_CPP_TAG = "b8935"
 # Only relevant for `--features cuda` builds:
 NVCC_PREPEND_FLAGS = "-std=c++17"
-# Turing (compute 7.5) — the LOWEST card we support (RTX 20xx, e.g. 2060) and
-# CUDA 13.0's real floor. candle emits PTX for this arch; the driver JIT-compiles
-# it up to the running GPU, so ONE binary runs on Turing through Blackwell (2060
-# → 4090 → 50xx). Do NOT raise this to the build box's own cap (was 89 / Ada) or
-# the release stops running on every card below it. (candle-flash-attn ignores
-# this and always builds sm_80, but the helper never launches flux2, so those
-# kernels just sit unused — see the koharu fork note in Cargo.toml.)
-CUDA_COMPUTE_CAP = "75"
+# Ampere (compute 8.0) — the lowest card the candle models run on in GPU mode.
+# candle emits PTX for this arch and the driver JIT-compiles it up to the running
+# GPU, so ONE binary runs on Ampere through Blackwell (3060 → 4090 → 50xx).
+#
+# Not 75: candle compiles its bf16 kernels only for 8.0+, the models call them, and
+# an sm_75 build fails on EVERY card with "named symbol not found" (measured
+# 2026-11-23). Turing and older run the candle models on the CPU instead —
+# candle_needs_cpu() in main.rs — while llama.cpp OCR keeps their GPU.
+# Not the build box's own cap either (89 / Ada): 0.1.14 and 0.1.15 shipped sm_89
+# kernels from a stale cache and failed on every pre-Ada card with
+# "CUDA_ERROR_INVALID_PTX". Cargo does NOT rebuild candle-kernels when this value
+# changes: run `cargo clean -p candle-kernels --release`; package.bat checks it.
+CUDA_COMPUTE_CAP = "80"
